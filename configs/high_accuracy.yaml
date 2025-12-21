@@ -1,0 +1,32 @@
+# High Accuracy RAJNI-ViT Configuration (Conservative Pruning)
+
+experiment_name: "rajni_vit_high_accuracy"
+seed: 42
+
+# Model Configuration
+model:
+  name: "vit_large_patch16_224"
+  pretrained: true
+  num_classes: 1000
+  image_size: 224
+
+# Conservative Pruning Configuration
+pruning:
+  pruning_ratio: 0.15  # Prune only 15% for better accuracy
+  num_pruning_layers: 4
+  keep_cls_token: true
+  importance_metric: "jacobian"
+
+# Evaluation Configuration
+eval:
+  batch_size: 16
+  num_workers: 4
+  dataset: "imagenet"
+  data_path: "./data/imagenet"
+  device: "cuda"
+
+# Logging Configuration
+logging:
+  log_dir: "./logs"
+  log_level: "INFO"
+  save_predictions: false
