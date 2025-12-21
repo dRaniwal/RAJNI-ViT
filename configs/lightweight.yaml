@@ -1,0 +1,32 @@
+# Lightweight RAJNI-ViT Configuration (High Pruning)
+
+experiment_name: "rajni_vit_lightweight"
+seed: 42
+
+# Model Configuration
+model:
+  name: "vit_base_patch16_224"
+  pretrained: true
+  num_classes: 1000
+  image_size: 224
+
+# Aggressive Pruning Configuration
+pruning:
+  pruning_ratio: 0.5  # Prune 50% of tokens for maximum efficiency
+  num_pruning_layers: 8
+  keep_cls_token: true
+  importance_metric: "jacobian"
+
+# Evaluation Configuration
+eval:
+  batch_size: 64
+  num_workers: 4
+  dataset: "imagenet"
+  data_path: "./data/imagenet"
+  device: "cuda"
+
+# Logging Configuration
+logging:
+  log_dir: "./logs"
+  log_level: "INFO"
+  save_predictions: false

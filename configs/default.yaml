@@ -1,0 +1,32 @@
+# Default RAJNI-ViT Evaluation Configuration
+
+experiment_name: "rajni_vit_base_eval"
+seed: 42
+
+# Model Configuration
+model:
+  name: "vit_base_patch16_224"
+  pretrained: true
+  num_classes: 1000
+  image_size: 224
+
+# RAJNI Pruning Configuration
+pruning:
+  pruning_ratio: 0.3  # Prune 30% of tokens
+  num_pruning_layers: 6  # Apply pruning to first 6 layers
+  keep_cls_token: true  # Always keep CLS token
+  importance_metric: "jacobian"  # Options: jacobian, attention, norm
+
+# Evaluation Configuration
+eval:
+  batch_size: 32
+  num_workers: 4
+  dataset: "imagenet"
+  data_path: "./data/imagenet"
+  device: "cuda"
+
+# Logging Configuration
+logging:
+  log_dir: "./logs"
+  log_level: "INFO"
+  save_predictions: false
