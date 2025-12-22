@@ -11,7 +11,7 @@ def visualise_pruning(
     patch_size=16,
     device="cuda",
     max_layers=None,
-    stats
+    stats=None,
 ):
     """
     Visualize RAJNI pruning by explicitly marking PRUNED patches.
