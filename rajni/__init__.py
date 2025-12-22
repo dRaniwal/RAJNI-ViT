@@ -11,4 +11,4 @@ Main entry points:
 from .model import AdaptiveJacobianPrunedViT
 from .benchmark import benchmark
 from .flops import flops_reduction
-from .visualize import visualize_pruning
+from .visualise import visualise_pruning

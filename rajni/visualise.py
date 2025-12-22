@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def visualize_pruning(image, kept_indices, patch_size=16):
+def visualise_pruning(image, kept_indices, patch_size=16):
     """
     Visualizes pruned patches layer-wise.
     """
