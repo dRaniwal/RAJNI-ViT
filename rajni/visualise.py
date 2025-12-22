@@ -1,39 +1,24 @@
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 
 
 def visualize_pruning(image, kept_indices, patch_size=16):
     """
-    Simple visualization of pruned patches.
-    Blue = pruned, Original = kept.
+    Visualizes pruned patches layer-wise.
     """
-    img = image.permute(1, 2, 0).cpu().numpy()
-    H, W, _ = img.shape
-
+    H, W, _ = image.shape
     grid = W // patch_size
-    mask = np.ones((grid, grid))
 
-    if kept_indices is not None:
-        kept = kept_indices[1:] - 1  # remove CLS
-        for idx in range(grid * grid):
-            if idx not in kept:
-                r = idx // grid
-                c = idx % grid
-                mask[r, c] = 0
+    fig, axes = plt.subplots(1, len(kept_indices), figsize=(16, 4))
 
-    plt.imshow(img)
-    for r in range(grid):
-        for c in range(grid):
-            if mask[r, c] == 0:
-                plt.gca().add_patch(
-                    plt.Rectangle(
-                        (c * patch_size, r * patch_size),
-                        patch_size,
-                        patch_size,
-                        fill=True,
-                        color="blue",
-                        alpha=0.4,
-                    )
-                )
-    plt.axis("off")
+    for i, idx in enumerate(kept_indices):
+        mask = np.zeros(grid * grid)
+        mask[idx[1:] - 1] = 1  # exclude CLS
+
+        mask = mask.reshape(grid, grid)
+        axes[i].imshow(image)
+        axes[i].imshow(mask, alpha=0.5)
+        axes[i].set_title(f"Layer {i}")
+        axes[i].axis("off")
+
     plt.show()

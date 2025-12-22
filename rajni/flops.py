@@ -1,41 +1,31 @@
-from .utils import unwrap_model
-
-
 def baseline_vit_flops(model, tokens):
     """
-    Rough ViT FLOPs estimate for comparison.
+    Approximate baseline ViT FLOPs per forward.
     """
-    D = model.embed_dim
     L = len(model.blocks)
-
-    attn = L * (tokens ** 2) * D
-    mlp = L * tokens * (D ** 2)
-
-    return attn + mlp
+    D = model.embed_dim
+    return L * (tokens ** 2) * D
 
 
-def adaptive_flops(token_counts, embed_dim):
+def adaptive_vit_flops(token_counts, embed_dim):
     """
-    FLOPs based on actual tokens used per layer.
+    FLOPs used by RAJNI based on token counts.
     """
     flops = 0
     for t in token_counts:
         flops += (t ** 2) * embed_dim
-        flops += t * (embed_dim ** 2)
     return flops
 
 
-def flops_reduction(model):
-    model = unwrap_model(model)
+def flops_reduction(model, stats):
+    """
+    Compare baseline vs RAJNI FLOPs.
+    """
+    token_counts = stats["token_counts"]
+    base_tokens = token_counts[0]
 
-    assert hasattr(model, "last_token_counts"), \
-        "Run a forward pass before computing FLOPs."
-
-    base_tokens = model.last_token_counts[0]
-    D = model.m.embed_dim
-
-    baseline = baseline_vit_flops(model.m, base_tokens)
-    used = adaptive_flops(model.last_token_counts, D)
+    baseline = baseline_vit_flops(model, base_tokens)
+    used = adaptive_vit_flops(token_counts, model.embed_dim)
 
     return {
         "baseline_GFLOPs": baseline / 1e9,

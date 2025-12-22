@@ -8,7 +8,7 @@ Main entry points:
 - AdaptiveJacobianPrunedViT
 - benchmark
 """
-
 from .model import AdaptiveJacobianPrunedViT
 from .benchmark import benchmark
-from .utils import print_token_counts
+from .flops import flops_reduction
+from .visualize import visualize_pruning

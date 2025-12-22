@@ -2,28 +2,25 @@ import time
 import torch
 from tqdm import tqdm
 
-from .utils import unwrap_model
-from .flops import flops_reduction
-
 
 @torch.no_grad()
-def benchmark(
-    model,
-    dataloader,
-    device="cuda",
-    warmup=5,
-    max_batches=None,
-):
+def benchmark(model, dataloader, device="cuda", warmup=5, max_batches=None):
+    """
+    Benchmarks accuracy + throughput.
+    Works with both DataParallel and single GPU.
+    """
+
     model.eval()
-    device = torch.device(device)
+    model.to(device)
 
     correct = 0
     total = 0
     total_images = 0
     total_time = 0.0
 
-    for i, (x, y) in enumerate(tqdm(dataloader, desc="RAJNI Benchmark")):
+    last_stats = None
 
+    for i, (x, y) in enumerate(tqdm(dataloader, desc="RAJNI Benchmark")):
         if max_batches and i >= max_batches:
             break
 
@@ -34,7 +31,12 @@ def benchmark(
             torch.cuda.synchronize()
             start = time.time()
 
-        logits = model(x)
+        out = model(x)
+        if isinstance(out, tuple):
+            logits, stats = out
+            last_stats = stats
+        else:
+            logits = out
 
         if i >= warmup:
             torch.cuda.synchronize()
@@ -45,18 +47,7 @@ def benchmark(
         correct += (pred == y).sum().item()
         total += y.size(0)
 
-    acc = correct / total
-    speed = total_images / total_time
+    acc = correct / max(total, 1)
+    speed = total_images / max(total_time, 1e-6)
 
-    core = unwrap_model(model)
-    flops = flops_reduction(core)
-
-    print("\n========== RAJNI RESULTS ==========")
-    print(f"Accuracy: {acc * 100:.2f}%")
-    print(f"Speed: {speed:.1f} img/s")
-    print(f"Baseline FLOPs: {flops['baseline_GFLOPs']:.2f} GF")
-    print(f"RAJNI FLOPs: {flops['rajni_GFLOPs']:.2f} GF")
-    print(f"Reduction: {flops['reduction_%']:.2f}%")
-    print("==================================")
-
-    return acc, speed, flops
+    return acc, speed, last_stats
