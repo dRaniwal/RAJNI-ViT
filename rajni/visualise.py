@@ -11,6 +11,7 @@ def visualise_pruning(
     patch_size=16,
     device="cuda",
     max_layers=None,
+    stats
 ):
     """
     Visualize RAJNI pruning by explicitly marking PRUNED patches.
@@ -27,8 +28,7 @@ def visualise_pruning(
 
     # ---- Forward pass (collect pruning info) ----
     _ = model(img)
-
-    kept_indices = model.last_kept_indices
+    kept_indices = stats["kept_indices"]
     if max_layers is not None:
         kept_indices = kept_indices[:max_layers]
 
