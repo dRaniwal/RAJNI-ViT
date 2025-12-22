@@ -12,3 +12,4 @@ from .model import AdaptiveJacobianPrunedViT
 from .benchmark import benchmark
 from .flops import flops_reduction
 from .visualise import visualise_pruning
+from .baseline_benchmark import baseline_benchmark
