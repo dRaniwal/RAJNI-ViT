@@ -23,8 +23,10 @@ def baseline_benchmark(
     - No pruning, no stats, no hooks
     """
 
+    # Handle DataParallel: don't call .to() if already wrapped
+    if not isinstance(model, torch.nn.DataParallel):
+        model.to(device)
     model.eval()
-    model.to(device)
 
     correct = 0
     total = 0
