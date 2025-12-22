@@ -1,6 +1,8 @@
 import time
 import torch
 from tqdm import tqdm
+
+from .utils import unwrap_model
 from .flops import flops_reduction
 
 
@@ -9,11 +11,11 @@ def benchmark(
     model,
     dataloader,
     device="cuda",
-    warmup=10,
+    warmup=5,
     max_batches=None,
 ):
     model.eval()
-    model.to(device)
+    device = torch.device(device)
 
     correct = 0
     total = 0
@@ -21,7 +23,8 @@ def benchmark(
     total_time = 0.0
 
     for i, (x, y) in enumerate(tqdm(dataloader, desc="RAJNI Benchmark")):
-        if max_batches is not None and i >= max_batches:
+
+        if max_batches and i >= max_batches:
             break
 
         x = x.to(device, non_blocking=True)
@@ -45,14 +48,15 @@ def benchmark(
     acc = correct / total
     speed = total_images / total_time
 
-    flops = flops_reduction(model)
+    core = unwrap_model(model)
+    flops = flops_reduction(core)
 
     print("\n========== RAJNI RESULTS ==========")
-    print(f"Accuracy:        {acc*100:.2f}%")
-    print(f"Speed:           {speed:.1f} img/s")
-    print(f"Baseline FLOPs:  {flops['baseline_flops']/1e9:.2f} GFLOPs")
-    print(f"RAJNI FLOPs:     {flops['rajni_flops']/1e9:.2f} GFLOPs")
-    print(f"Reduction:      {flops['reduction_pct']:.2f}%")
-    print("==================================\n")
+    print(f"Accuracy: {acc * 100:.2f}%")
+    print(f"Speed: {speed:.1f} img/s")
+    print(f"Baseline FLOPs: {flops['baseline_GFLOPs']:.2f} GF")
+    print(f"RAJNI FLOPs: {flops['rajni_GFLOPs']:.2f} GF")
+    print(f"Reduction: {flops['reduction_%']:.2f}%")
+    print("==================================")
 
     return acc, speed, flops

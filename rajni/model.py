@@ -8,13 +8,13 @@ class AdaptiveJacobianPrunedViT(nn.Module):
     """
     RAJNI: Adaptive Jacobian-based Token Pruning for Vision Transformers.
 
-    Key ideas implemented here:
-    - Patch importance from CLS Jacobian approximation
+    Key ideas:
+    - Jacobian-based patch importance via CLS attention
     - V-centering to remove positional bias
-    - Adaptive pruning budget using derived CLS sensitivity ratio (rho)
-    - No training required, inference-only modification
+    - Adaptive pruning using derived CLS sensitivity ratio (rho)
+    - Inference-only, training-free
 
-    This wrapper assumes a standard timm ViT / DeiT-style model.
+    This wrapper is DataParallel-safe and FLOPs-accountable.
     """
 
     def __init__(
@@ -33,19 +33,22 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         self.min_tokens = min_tokens
         self.eps = eps
 
-        # Automatically inferred properties
+        # Inferred model properties
         self.embed_dim = model.embed_dim
         self.num_heads = model.blocks[0].attn.num_heads
 
-        # For analysis & visualization
+        # For analysis / visualization
         self.last_kept_indices = []
         self.last_token_counts = []
-        self.last_flops = []
 
     def forward(self, x):
         B = x.size(0)
 
-        # ---- Patch embedding + positional encoding (unchanged) ----
+        # Reset logging buffers every forward
+        self.last_kept_indices = []
+        self.last_token_counts = []
+
+        # ---- Patch embedding + positional encoding ----
         with autocast(device_type="cuda"):
             x = self.m.patch_embed(x)
             x = self.m._pos_embed(x)
@@ -54,17 +57,12 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         # Number of patch tokens (excluding CLS)
         N = x.size(1) - 1
 
-        # Reset logging buffers every forward
-        self.last_kept_indices = []
-        self.last_token_counts = []
-        self.last_flops = []
-
         prev_mass = None
 
         for layer_id, blk in enumerate(self.blocks):
 
             # =========================
-            # Attention forward pass
+            # Attention forward
             # =========================
             with autocast(device_type="cuda"):
                 x_norm = blk.norm1(x)
@@ -76,7 +74,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
 
                 q, k, v = qkv[0], qkv[1], qkv[2]
 
-                # Full attention (used for actual output)
                 A = (q @ k.transpose(-2, -1)) * attn.scale
                 A = A.softmax(dim=-1)
 
@@ -86,23 +83,23 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 x = x + blk.drop_path1(out)
                 x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
 
-            # Record token count (including CLS)
-            self.last_token_counts.append(N + 1)
-
-            # Stop pruning if token budget is already small
+            # =========================
+            # Stop pruning if too few tokens
+            # =========================
             if N <= self.min_tokens:
+                # Still log token count for FLOPs consistency
+                self.last_token_counts.append(N + 1)
                 continue
 
             # =========================
-            # === Derived rho (CLS sensitivity)
+            # Derived rho (CLS sensitivity)
             # =========================
-            A_mean = A.mean(1)                 # [B, N+1, N+1]
-            A_cls_cls = A_mean[:, 0, 0]        # self-attention of CLS
+            A_mean = A.mean(1)                 # [B, T, T]
+            A_cls_cls = A_mean[:, 0, 0]        # CLS → CLS attention
 
             V_cls = v.mean(1)[:, 0]            # CLS value vector
             V_cls_norm = V_cls.norm(dim=-1)
 
-            # Derived sensitivity ratio:
             # rho_l ≈ 1 + A_cls->cls * ||V_cls||
             rho = (1.0 + A_cls_cls * V_cls_norm).mean()
 
@@ -110,9 +107,9 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             # Patch importance (Jacobian-based)
             # =========================
             A_cls = A_mean[:, 0, 1:N+1]         # CLS → patch attention
-            V_pt = v.mean(1)[:, 1:N+1]          # patch value vectors
+            V_pt = v.mean(1)[:, 1:N+1]          # patch values
 
-            # V-centering to remove positional dominance
+            # V-centering (critical for ImageNet)
             V_centered = V_pt - V_pt.mean(dim=1, keepdim=True)
             V_norm = V_centered.norm(dim=-1)
 
@@ -120,7 +117,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             std = V_norm.std(dim=1, keepdim=True)
 
             V_gate = F.relu((V_norm - mu) / (std + self.eps))
-            J = A_cls * V_gate                  # final patch importance
+            J = A_cls * V_gate                  # patch importance
 
             mass = J.sum(dim=1).mean()
 
@@ -143,7 +140,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 score = J.mean(0)
                 _, idx = torch.topk(score, k=N_next)
 
-                idx = idx.sort().values + 1  # shift for CLS token
+                idx = idx.sort().values + 1  # shift for CLS
                 keep_idx = torch.cat([
                     torch.zeros(1, device=x.device, dtype=torch.long),
                     idx
@@ -153,9 +150,12 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 x = x[:, keep_idx]
                 N = N_next
 
+            # ---- LOG FINAL token count for this layer ----
+            self.last_token_counts.append(N + 1)
+
             prev_mass = mass
 
-        # ---- Final normalization + head ----
+        # ---- Final norm + head ----
         with autocast(device_type="cuda"):
             x = self.m.norm(x)
             logits = self.m.head(x[:, 0])
