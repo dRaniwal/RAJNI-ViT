@@ -1,4 +1,3 @@
-from rajni.utils import unwrap_model
 def baseline_vit_flops(model, tokens):
     """
     Approximate baseline ViT FLOPs per forward.
@@ -23,13 +22,11 @@ def flops_reduction(model, stats):
     """
     Compare baseline vs RAJNI FLOPs.
     """
-    core = unwrap_model(model)
-
     token_counts = stats["token_counts"]
     base_tokens = token_counts[0]
 
-    baseline = baseline_vit_flops(core, base_tokens)
-    used = adaptive_vit_flops(token_counts, core.embed_dim)
+    baseline = baseline_vit_flops(model, base_tokens)
+    used = adaptive_vit_flops(token_counts, model.embed_dim)
 
     return {
         "baseline_GFLOPs": baseline / 1e9,
