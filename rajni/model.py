@@ -10,12 +10,14 @@ class AdaptiveJacobianPrunedViT(nn.Module):
 
     Design principles:
     - Inference-only (no training required)
-    - Stateless (DataParallel-safe)
-    - All pruning statistics are RETURNED, not stored
+    - DataParallel-safe (returns only tensors from forward)
+    - Stats accessible via get_last_stats() method
 
     Forward returns:
         logits: Tensor [B, num_classes]
-        stats:  dict with token_counts & kept_indices
+    
+    Stats available via:
+        model.get_last_stats() -> dict with token_counts & kept_indices
     """
 
     def __init__(self, model, gamma=0.01, min_tokens=16, eps=1e-6):
@@ -28,6 +30,11 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         self.eps = eps
 
         self.num_heads = self.blocks[0].attn.num_heads
+        self._last_stats = None
+
+    def get_last_stats(self):
+        """Get stats from the last forward pass (DataParallel-safe)."""
+        return self._last_stats
 
     def forward(self, x):
         B = x.size(0)
@@ -134,9 +141,10 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             x = self.m.norm(x)
             logits = self.m.head(x[:, 0])
 
-        stats = {
+        # Store stats for later retrieval (DataParallel-safe)
+        self._last_stats = {
             "token_counts": token_counts,
             "kept_indices": kept_indices,
         }
 
-        return logits, stats
+        return logits

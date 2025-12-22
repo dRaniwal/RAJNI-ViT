@@ -31,12 +31,13 @@ def benchmark(model, dataloader, device="cuda", warmup=5, max_batches=None):
             torch.cuda.synchronize()
             start = time.time()
 
-        out = model(x)
-        if isinstance(out, tuple):
-            logits, stats = out
-            last_stats = stats
+        logits = model(x)
+
+        # Get stats from the model (DataParallel-safe)
+        if isinstance(model, torch.nn.DataParallel):
+            last_stats = model.module.get_last_stats()
         else:
-            logits = out
+            last_stats = model.get_last_stats()
 
         if i >= warmup:
             torch.cuda.synchronize()
