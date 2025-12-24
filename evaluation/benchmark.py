@@ -62,7 +62,7 @@ def benchmark(
     model: nn.Module,
     dataloader: DataLoader,
     device: str = "cuda",
-    warmup: int = 5,
+    warmup: int = 10,
     max_batches: Optional[int] = None,
     use_cuda_events: bool = True,
 ) -> Tuple[float, float, Optional[Dict[str, Any]]]:

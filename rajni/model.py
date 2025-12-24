@@ -34,7 +34,6 @@ if hasattr(torch, '_inductor'):
 from .pruning import (
     compute_cls_sensitivity,
     compute_jacobian_importance,
-    compute_importance_and_sensitivity,
     compute_keep_ratio,
     select_tokens,
 )
@@ -85,12 +84,8 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         self.eps = eps
         self.collect_stats = collect_stats
         
-        # Pre-compute constants (avoid recomputation in forward)
         self.num_heads = model.blocks[0].attn.num_heads
         self.embed_dim = model.embed_dim
-        self.head_dim = self.embed_dim // self.num_heads
-        self.num_blocks = len(model.blocks)
-        self.scale = model.blocks[0].attn.scale
         
         self._last_stats: Optional[Dict[str, Any]] = None
 
@@ -106,13 +101,16 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         num_tokens: int,
     ) -> tuple:
         """Extract attention weights and value vectors from attention module."""
+        head_dim = self.embed_dim // self.num_heads
+        
         qkv = attn_module.qkv(x_norm)
-        qkv = qkv.reshape(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
+        qkv = qkv.reshape(batch_size, num_tokens, 3, self.num_heads, head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         
-        q, k, v = qkv.unbind(0)  # Faster than indexing for small tensors
+        q, k, v = qkv[0], qkv[1], qkv[2]
         
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        scale = attn_module.scale
+        attn = (q @ k.transpose(-2, -1)) * scale
         attn = attn.softmax(dim=-1)
         
         out = (attn @ v).transpose(1, 2).reshape(batch_size, num_tokens, -1)
@@ -158,15 +156,12 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 prev_mass = None
                 continue
             
-            # Compute importance and sensitivity in one fused call (reduces kernel launches)
-            # Pass layer index for calibrated rho
-            importance, mass, rho = compute_importance_and_sensitivity(
-                attn, v, N, layer_idx=i, calibrate=True, eps=self.eps
-            )
+            # Compute importance scores (all on GPU)
+            rho = compute_cls_sensitivity(attn, i, v)
+            importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
             
             # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
             if prev_mass is not None:
-                
                 keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
                 # .item() is now traced by torch.compile with capture_scalar_outputs=True
                 N_next = max(self.min_tokens, int(N * keep_ratio))

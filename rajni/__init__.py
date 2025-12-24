@@ -22,12 +22,9 @@ __author__ = "Dhairya Raniwal"
 
 from .model import AdaptiveJacobianPrunedViT
 from .utils import unwrap_model, denormalize_image
-from .pruning import RHO_CALIBRATION_COEFFICIENTS, calibrate_rho
 
 __all__ = [
     "AdaptiveJacobianPrunedViT",
     "unwrap_model",
     "denormalize_image",
-    "RHO_CALIBRATION_COEFFICIENTS",
-    "calibrate_rho",
 ]

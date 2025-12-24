@@ -8,16 +8,11 @@ The key insight is that we approximate the Jacobian of the CLS token
 w.r.t. patch tokens using attention weights and value norms, avoiding
 expensive backpropagation during inference.
 """
+import math
 from typing import Tuple, Optional
 import torch
 import torch.nn.functional as F
-import math
 
-# Layer-specific calibration coefficients for ρ (rho)
-# Fitted via linear regression on ImageNet validation data:
-#   calibrated_rho = a * raw_rho + b
-# These coefficients correct the systematic overestimation of raw ρ
-# See scripts/validate_rho.py for validation methodology
 RHO_CALIBRATION_COEFFICIENTS = {
     # Layer: (slope a, intercept b) - fitted via least squares
     0:  (0.40, 0.20),   # ρ_raw ~1.40 → exact ~0.75
@@ -33,7 +28,6 @@ RHO_CALIBRATION_COEFFICIENTS = {
     10: (0.85, 0.02),   # ρ_raw ~1.01 → exact ~0.88
     11: (0.95, 0.20),   # ρ_raw ~1.01 → exact ~1.15 (gradient amplification)
 }
-
 
 def calibrate_rho(rho_raw: torch.Tensor, layer_idx: int) -> torch.Tensor:
     """
@@ -55,48 +49,42 @@ def calibrate_rho(rho_raw: torch.Tensor, layer_idx: int) -> torch.Tensor:
     a, b = RHO_CALIBRATION_COEFFICIENTS.get(layer_idx, (0.55, 0.20))
     return a * rho_raw + b
 
-
 def compute_cls_sensitivity(
     attention: torch.Tensor,
+    layer_idx: int,
     values: torch.Tensor,
-    layer_idx: int = 0,
-    calibrate: bool = True,
 ) -> torch.Tensor:
     """
     Compute CLS token sensitivity (rho) from attention and values.
     
     This measures how much the CLS token attends to itself, weighted
-    by the norm of its value vector. Uses centered V for consistency
-    with patch importance computation.
+    by the norm of its value vector. High rho indicates the model
+    is confident and less aggressive pruning is appropriate.
     
     Args:
         attention: Attention weights [B, H, N, N] after softmax
         values: Value vectors [B, H, N, D]
-        layer_idx: Layer index for calibration (0-11 for ViT-Base)
-        calibrate: Whether to apply layer-specific calibration
     
     Returns:
-        rho: Scalar sensitivity measure (calibrated if enabled)
+        rho: Scalar sensitivity measure
     """
     # Average across heads
     A_mean = attention.mean(dim=1)  # [B, N, N]
     A_cls_cls = A_mean[:, 0, 0]     # [B] - CLS self-attention
     
-    # CLS value vector norm with centering (consistent with patch importance)
+    # CLS value vector norm (averaged across heads)
     V_mean_heads = values.mean(dim=1)  # [B, N, D]
     V_cls = V_mean_heads[:, 0]  # [B, D]
-    V_mean = V_mean_heads.mean(dim=1)  # [B, D] - mean across all tokens
-    V_cls_centered = V_cls - V_mean
-    V_cls_norm = V_cls_centered.norm(dim=-1)   # [B]
     
-
-    # Raw sensitivity: how "anchored" is the CLS token
-    rho_raw = (1.0 + A_cls_cls * V_cls_norm)
-    # Apply calibration if enabled
-
-    rho_calib = calibrate_rho(rho_raw, layer_idx)
-        # print(f"rho_calib: {rho_calib}")
-    return rho_calib  # Return per-sample calibrated rho
+    # Center CLS value (consistent with patch importance centering)
+    V_global_mean = V_mean_heads.mean(dim=1)  # [B, D]
+    V_cls_centered = V_cls - V_global_mean
+    V_cls_norm = V_cls_centered.norm(dim=-1)  # [B]
+    
+    # Sensitivity: how "anchored" is the CLS token
+    rho = (1.0 + A_cls_cls * V_cls_norm)
+    rho = calibrate_rho(rho, layer_idx)
+    return rho.mean()
 
 
 def compute_jacobian_importance(
@@ -109,7 +97,7 @@ def compute_jacobian_importance(
     Compute Jacobian-based importance scores for patch tokens.
     
     We approximate the Jacobian of CLS w.r.t. patches as:
-        J_i ≈ A[cls→i] * ||V_i - mean(V||
+        J_i ≈ A[cls→i] * ||V_i - mean(V)||
     
     This captures both attention flow (which patches CLS attends to)
     and value saliency (which patches have distinctive features).
@@ -136,84 +124,21 @@ def compute_jacobian_importance(
     # Center the value vectors (critical for meaningful norms)
     V_mean = V_patches.mean(dim=1, keepdim=True)
     V_centered = V_patches - V_mean
-    V_norm = V_centered.norm(dim=-1)
-
-    # Robust contrastive gating (MATCHES model.py)
-    median = V_norm.median(dim=1, keepdim=True).values
-    mad = (V_norm - median).abs().mean(dim=1, keepdim=True)
-
-    V_gate = F.relu((V_norm - median) / (mad + eps))
-    importance = A_cls_to_patches * V_gate
+    V_norm = V_centered.norm(dim=-1)  # [B, num_patches]
+    
+    # Standardize within each sample
+    mu = V_norm.mean(dim=1, keepdim=True)
+    std = V_norm.std(dim=1, keepdim=True)
+    V_standardized = (V_norm - mu) / (std + eps)
+    
+    # Jacobian importance: attention * ReLU(standardized value norm)
+    # ReLU ensures we only keep positively salient tokens
+    importance = A_cls_to_patches * F.relu(V_standardized)
+    
+    # Total mass for adaptive budget computation
     mass = importance.sum(dim=1).mean()
     
     return importance, mass
-
-
-def compute_importance_and_sensitivity(
-    attention: torch.Tensor,
-    values: torch.Tensor,
-    num_patches: int,
-    layer_idx: int = 0,
-    calibrate: bool = True,
-    eps: float = 1e-6,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fused computation of both importance scores and CLS sensitivity.
-    
-    This combines compute_cls_sensitivity and compute_jacobian_importance
-    to reduce redundant operations (A_mean computed once).
-    
-    Args:
-        attention: Attention weights [B, H, N, N] after softmax
-        values: Value vectors [B, H, N, D]
-        num_patches: Number of patch tokens (excluding CLS)
-        layer_idx: Layer index for rho calibration (0-11 for ViT-Base)
-        calibrate: Whether to apply layer-specific rho calibration
-        eps: Small constant for numerical stability
-    
-    Returns:
-        importance: Per-patch importance scores [B, num_patches]
-        mass: Total importance mass (scalar)
-        rho: CLS sensitivity (scalar, calibrated if enabled)
-    """
-    # Average attention across heads (compute once)
-    A_mean = attention.mean(dim=1)  # [B, N, N]
-    
-    # === CLS Sensitivity (rho) with centered V ===
-    A_cls_cls = A_mean[:, 0, 0]  # [B]
-    V_mean_heads = values.mean(dim=1)  # [B, N, D]
-    V_cls = V_mean_heads[:, 0]  # [B, D]
-    
-    # Center CLS value (consistent with patch importance centering)
-    V_global_mean = V_mean_heads.mean(dim=1)  # [B, D]
-    V_cls_centered = V_cls - V_global_mean
-    V_cls_norm = V_cls_centered.norm(dim=-1)  # [B]
-    
-    # Raw rho
-    rho_raw = (1.0 + A_cls_cls * V_cls_norm)
-    
-    # Apply calibration if enabled
-
-    rho = calibrate_rho(rho_raw, layer_idx).mean()
-
-    
-    # === Jacobian Importance ===
-    A_cls_to_patches = A_mean[:, 0, 1:num_patches + 1]  # [B, num_patches]
-    V_patches = V_mean_heads[:, 1:num_patches + 1]  # [B, num_patches, D]
-    
-        # Center and normalize value vectors
-    V_patch_mean = V_patches.mean(dim=1, keepdim=True)
-    V_centered = V_patches - V_patch_mean
-    V_norm = V_centered.norm(dim=-1)
-
-    median = V_norm.median(dim=1, keepdim=True).values
-    mad = (V_norm - median).abs().mean(dim=1, keepdim=True)
-
-    V_gate = F.relu((V_norm - median) / (mad + eps))
-    importance = A_cls_to_patches * V_gate
-    mass = importance.sum(dim=1).mean()
-    
-    return importance, mass, rho
 
 
 def compute_keep_ratio(
@@ -247,10 +172,9 @@ def compute_keep_ratio(
     
     # Adaptive keep ratio with clamping for stability
     # Returns a tensor to avoid GPU-CPU sync
-    # ratio_raw =(rho ).clamp(0.25, 1.0) / (gamma)
-    # prune_ratio =(rho-0.8)*(gamma).clamp(0.0, 2)
-    ratio_raw=min(math.exp(-(rho-0.6)*gamma),1)
-    return ratio_raw
+    keep_ratio = math.exp(-(rho - 0.6) * gamma)
+
+    return keep_ratio
 
 
 @torch.no_grad()
