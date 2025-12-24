@@ -92,15 +92,12 @@ def compute_cls_sensitivity(
 
     # Raw sensitivity: how "anchored" is the CLS token
     rho_raw = (1.0 + A_cls_cls * V_cls_norm)
-    print(f"Layer {layer_idx}: rho_raw = {rho_raw}")
+    # print(f"Layer {layer_idx}: rho_raw = {rho_raw}")
     # Apply calibration if enabled
-    if calibrate:
-        # Apply calibration per sample
-        rho_calib = calibrate_rho(rho_raw, layer_idx)
-        print(f"rho_calib: {rho_calib}")
-        return rho_calib  # Return per-sample calibrated rho
-    else:
-        return rho_raw
+
+    rho_calib = calibrate_rho(rho_raw, layer_idx)
+        # print(f"rho_calib: {rho_calib}")
+    return rho_calib  # Return per-sample calibrated rho
 
 
 def compute_jacobian_importance(
