@@ -136,12 +136,14 @@ def compute_jacobian_importance(
     # Center the value vectors (critical for meaningful norms)
     V_mean = V_patches.mean(dim=1, keepdim=True)
     V_centered = V_patches - V_mean
-    V_norm = V_centered.norm(dim=-1)  # [B, num_patches]
-    
-    # Jacobian importance: attention * value norm (derivation-faithful)
-    importance = A_cls_to_patches * V_norm
-    
-    # Total mass for adaptive budget computation
+    V_norm = V_centered.norm(dim=-1)
+
+    # Robust contrastive gating (MATCHES model.py)
+    median = V_norm.median(dim=1, keepdim=True).values
+    mad = (V_norm - median).abs().mean(dim=1, keepdim=True)
+
+    V_gate = F.relu((V_norm - median) / (mad + eps))
+    importance = A_cls_to_patches * V_gate
     mass = importance.sum(dim=1).mean()
     
     return importance, mass
