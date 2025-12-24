@@ -59,7 +59,7 @@ def _make_attn_forward_with_capture(
     num_heads = attn_module.num_heads
     scale = attn_module.scale
     
-    def forward_with_capture(x: torch.Tensor) -> torch.Tensor:
+    def forward_with_capture(x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, N, C = x.shape
         head_dim = C // num_heads
         
@@ -69,6 +69,11 @@ def _make_attn_forward_with_capture(
         
         # Attention computation (same as timm)
         attn = (q @ k.transpose(-2, -1)) * scale
+        
+        # Apply attention mask if provided
+        if attn_mask is not None:
+            attn = attn + attn_mask
+        
         attn = attn.softmax(dim=-1)
         attn = attn_module.attn_drop(attn)
         
