@@ -89,6 +89,10 @@ def compute_cls_sensitivity(
     V_cls_centered = V_cls - V_mean
     V_cls_norm = V_cls_centered.norm(dim=-1)   # [B]
     
+
+    V_all_mean = V_mean.mean(dim=1)  # [B, D] - mean across all tokens
+    V_cls_centered = V_cls - V_all_mean  # [B, D]
+    V_cls_norm = V_cls_centered.norm(dim=-1)  # [B]
     # Raw sensitivity: how "anchored" is the CLS token
     rho_raw = (1.0 + A_cls_cls * V_cls_norm).mean()
     
