@@ -99,7 +99,8 @@ def compute_cls_sensitivity(
         rho_calib = calibrate_rho(rho_raw, layer_idx)
         print(f"rho_calib: {rho_calib}")
         return rho_calib  # Return per-sample calibrated rho
-    return rho_raw
+    else:
+        return rho_raw
 
 
 def compute_jacobian_importance(
