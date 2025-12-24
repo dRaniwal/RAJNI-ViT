@@ -18,6 +18,7 @@ Usage:
     python scripts/validate_rho.py
     python scripts/validate_rho.py --model vit_small_patch16_224
     python scripts/validate_rho.py --batch_size 4 --num_samples 10
+    python scripts/validate_rho.py --use_real_images --data_dir /path/to/imagenet
 """
 
 import argparse
@@ -27,43 +28,69 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import timm
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 
-def get_cls_tokens_with_grad(model: nn.Module, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
+def compute_gradients_with_hooks(
+    model: nn.Module,
+    x: torch.Tensor,
+    target_class: Optional[int] = None,
+) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
     """
-    Forward pass that captures CLS token at each layer with gradients enabled.
+    Compute exact ∂y/∂CLS_l using register_hook.
+    
+    The key insight: register_hook captures gradients as they flow through
+    the computation graph, without breaking the graph like clone() does.
     
     Args:
         model: timm ViT model
         x: Input images [B, 3, H, W]
+        target_class: Class to compute gradient for (None = predicted class)
     
     Returns:
-        logits: Model output [B, num_classes]
-        cls_tokens: List of CLS tokens at each layer [B, D]
-        attn_values: List of (attention_weights, values) at each layer
+        cls_grads: List of gradients ∂y/∂CLS_l for each layer
+        attn_values: Attention weights and values at each layer
     """
-    # Patch embedding
-    x = model.patch_embed(x)
-    x = model._pos_embed(x)
-    x = model.patch_drop(x)
+    model.eval()
     
-    cls_tokens = []
-    attn_values = []
+    # Storage for captured data
+    attn_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    grad_holders: List[List[Optional[torch.Tensor]]] = []  # Each is [None] to capture
+    hook_handles: List[Any] = []
     
     num_heads = model.blocks[0].attn.num_heads
     head_dim = model.embed_dim // num_heads
     scale = model.blocks[0].attn.scale
     
+    # Forward pass with gradient tracking
+    x = x.requires_grad_(True)
+    
+    # Patch embedding
+    h = model.patch_embed(x)
+    h = model._pos_embed(h)
+    h = model.patch_drop(h)
+    
     for i, blk in enumerate(model.blocks):
-        # Store CLS token BEFORE this block (requires grad for backprop)
-        cls_token = x[:, 0].clone()
-        cls_token.retain_grad()
-        cls_tokens.append(cls_token)
+        B, N, C = h.shape
         
-        # Manual attention to capture weights
-        B, N, C = x.shape
-        x_norm = blk.norm1(x)
+        # Register hook on CLS token to capture gradient
+        # The hook fires during backward pass
+        cls_token = h[:, 0:1, :]  # Keep dim for proper gradient shape [B, 1, D]
+        
+        grad_holder: List[Optional[torch.Tensor]] = [None]
+        grad_holders.append(grad_holder)
+        
+        def make_hook(holder):
+            def hook(grad):
+                # grad has shape [B, 1, D], squeeze to [B, D]
+                holder[0] = grad[:, 0, :].detach().clone()
+            return hook
+        
+        handle = cls_token.register_hook(make_hook(grad_holder))
+        hook_handles.append(handle)
+        
+        # Manual attention computation to capture weights
+        x_norm = blk.norm1(h)
         
         qkv = blk.attn.qkv(x_norm)
         qkv = qkv.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
@@ -72,80 +99,53 @@ def get_cls_tokens_with_grad(model: nn.Module, x: torch.Tensor) -> Tuple[torch.T
         attn = (q @ k.transpose(-2, -1)) * scale
         attn = attn.softmax(dim=-1)
         
-        # Store attention and values
+        # Store attention and values (detached for analysis)
         attn_values.append((attn.detach().clone(), v.detach().clone()))
         
-        # Complete attention
-        attn_out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # Complete the attention with dropout
+        attn_dropped = blk.attn.attn_drop(attn)
+        attn_out = (attn_dropped @ v).transpose(1, 2).reshape(B, N, C)
         attn_out = blk.attn.proj(attn_out)
         attn_out = blk.attn.proj_drop(attn_out)
         
         # Residual + MLP
-        x = x + blk.drop_path1(attn_out)
-        x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
+        h = h + blk.drop_path1(attn_out)
+        h = h + blk.drop_path2(blk.mlp(blk.norm2(h)))
     
-    # Final CLS token (after last block)
-    cls_token = x[:, 0].clone()
-    cls_token.retain_grad()
-    cls_tokens.append(cls_token)
+    # Final CLS token hook (after all blocks)
+    final_cls = h[:, 0:1, :]
+    final_grad_holder: List[Optional[torch.Tensor]] = [None]
+    grad_holders.append(final_grad_holder)
+    
+    final_handle = final_cls.register_hook(make_hook(final_grad_holder))
+    hook_handles.append(final_handle)
     
     # Classification head
-    x = model.norm(x)
-    logits = model.head(x[:, 0])
-    
-    return logits, cls_tokens, attn_values
-
-
-def compute_exact_cls_gradients(
-    model: nn.Module,
-    x: torch.Tensor,
-    target_class: Optional[int] = None,
-) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
-    """
-    Compute exact ∂y/∂CLS_l for each layer via backpropagation.
-    
-    Args:
-        model: timm ViT model
-        x: Input images [B, 3, H, W]
-        target_class: Class to compute gradient for (None = predicted class)
-    
-    Returns:
-        cls_grads: List of gradient norms ||∂y/∂CLS_l|| for each layer
-        attn_values: Attention weights and values at each layer
-    """
-    model.eval()
-    x = x.clone().requires_grad_(True)
-    
-    # Forward with CLS token capture
-    logits, cls_tokens, attn_values = get_cls_tokens_with_grad(model, x)
+    h_norm = model.norm(h)
+    logits = model.head(h_norm[:, 0])
     
     # Select target class
     if target_class is None:
         target_class = logits.argmax(dim=-1)
     
-    # Create one-hot target
+    # Create scalar loss for backward
     if isinstance(target_class, int):
-        target = torch.zeros_like(logits)
-        target[:, target_class] = 1.0
+        loss = logits[:, target_class].sum()
     else:
-        target = torch.zeros_like(logits)
-        target.scatter_(1, target_class.unsqueeze(1), 1.0)
+        # Gather the logits for each sample's target class
+        loss = logits.gather(1, target_class.unsqueeze(1)).sum()
     
-    # Compute y = sum of logits for target class (scalar for gradient)
-    y = (logits * target).sum()
+    # Backward pass - hooks will capture gradients
+    loss.backward()
     
-    # Backpropagate
-    y.backward(retain_graph=True)
-    
-    # Collect gradients
+    # Collect gradients from hooks
     cls_grads = []
-    for i, cls_token in enumerate(cls_tokens):
-        if cls_token.grad is not None:
-            # Gradient: ∂y/∂CLS_l [B, D]
-            grad = cls_token.grad.clone()
-            cls_grads.append(grad)
-        else:
-            cls_grads.append(None)
+    for holder in grad_holders:
+        cls_grads.append(holder[0])
+    
+    # Clean up hooks
+    for handle in hook_handles:
+        handle.remove()
     
     return cls_grads, attn_values
 
@@ -178,12 +178,47 @@ def compute_rajni_rho(
     return rho
 
 
+def get_imagenet_val_loader(data_dir: str, batch_size: int = 4, num_workers: int = 4):
+    """Create ImageNet validation loader with proper transforms."""
+    from torchvision import datasets, transforms
+    
+    normalize = transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+    
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    
+    val_dir = Path(data_dir) / "val"
+    if not val_dir.exists():
+        val_dir = Path(data_dir)
+    
+    dataset = datasets.ImageFolder(str(val_dir), transform=val_transform)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    
+    return loader
+
+
 def validate_rho(
     model_name: str = "vit_base_patch16_224",
-    batch_size: int = 2,
+    batch_size: int = 4,
     num_samples: int = 5,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     seed: int = 42,
+    use_real_images: bool = False,
+    data_dir: Optional[str] = None,
+    val_loader=None,  # Can pass existing loader from Kaggle
 ):
     """
     Main validation function.
@@ -192,6 +227,16 @@ def validate_rho(
     1. Exact: ||∂y/∂CLS_l|| via backprop
     2. Exact ratio: ||∂y/∂CLS_{l+1}|| / ||∂y/∂CLS_l||
     3. RAJNI ρ: 1 + A(CLS→CLS) · ||V_CLS||
+    
+    Args:
+        model_name: timm model name
+        batch_size: Batch size for validation
+        num_samples: Number of batches to test
+        device: Device to run on
+        seed: Random seed
+        use_real_images: Use real images instead of random tensors
+        data_dir: Path to ImageNet (if use_real_images and no val_loader)
+        val_loader: Existing DataLoader to use (e.g., from Kaggle)
     """
     torch.manual_seed(seed)
     
@@ -202,6 +247,7 @@ def validate_rho(
     print(f"Device: {device}")
     print(f"Batch size: {batch_size}")
     print(f"Num samples: {num_samples}")
+    print(f"Using real images: {use_real_images or val_loader is not None}")
     print()
     
     # Load model
@@ -215,6 +261,18 @@ def validate_rho(
     print(f"Embed dim: {model.embed_dim}")
     print()
     
+    # Setup data source
+    if val_loader is not None:
+        print("Using provided val_loader")
+        data_iter = iter(val_loader)
+    elif use_real_images and data_dir:
+        print(f"Loading ImageNet validation from {data_dir}...")
+        val_loader = get_imagenet_val_loader(data_dir, batch_size=batch_size)
+        data_iter = iter(val_loader)
+    else:
+        data_iter = None
+        print("Using random input tensors (normalized like ImageNet)")
+    
     # Accumulators for statistics
     all_exact_ratios = [[] for _ in range(num_layers)]
     all_rajni_rhos = [[] for _ in range(num_layers)]
@@ -225,11 +283,25 @@ def validate_rho(
         print(f"Sample {sample_idx + 1}/{num_samples}")
         print(f"{'─' * 70}")
         
-        # Random input
-        x = torch.randn(batch_size, 3, 224, 224, device=device)
+        # Get input
+        if data_iter is not None:
+            try:
+                images, labels = next(data_iter)
+            except StopIteration:
+                data_iter = iter(val_loader)
+                images, labels = next(data_iter)
+            x = images.to(device)
+            print(f"  Using real images, batch labels: {labels.tolist()[:4]}...")
+        else:
+            # Random normalized input (like ImageNet stats)
+            x = torch.randn(batch_size, 3, 224, 224, device=device)
+            # Normalize to ImageNet-like distribution
+            mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+            x = x * std + mean
         
-        # Compute exact gradients
-        cls_grads, attn_values = compute_exact_cls_gradients(model, x)
+        # Compute exact gradients using hooks
+        cls_grads, attn_values = compute_gradients_with_hooks(model, x)
         
         # Compute gradient norms
         grad_norms = []
@@ -350,24 +422,34 @@ def validate_rho(
   CLS_{l+1} = CLS_l + Attention(CLS_l)
   So ∂CLS_{l+1}/∂CLS_l = 1 + ∂Attention/∂CLS_l
 """)
+    
+    return all_exact_ratios, all_rajni_rhos, all_grad_norms
 
 
 def main():
     parser = argparse.ArgumentParser(description="Validate RAJNI rho approximation")
     parser.add_argument("--model", type=str, default="vit_base_patch16_224",
                         help="timm model name")
-    parser.add_argument("--batch_size", type=int, default=2,
+    parser.add_argument("--batch_size", type=int, default=4,
                         help="Batch size for validation")
     parser.add_argument("--num_samples", type=int, default=5,
-                        help="Number of random samples to test")
+                        help="Number of batches to test")
     parser.add_argument("--device", type=str, default=None,
                         help="Device (default: cuda if available)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--use_real_images", action="store_true",
+                        help="Use real ImageNet images instead of random tensors")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Path to ImageNet directory (required if --use_real_images)")
     
     args = parser.parse_args()
     
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if args.use_real_images and not args.data_dir:
+        print("ERROR: --data_dir required when using --use_real_images")
+        sys.exit(1)
     
     validate_rho(
         model_name=args.model,
@@ -375,6 +457,8 @@ def main():
         num_samples=args.num_samples,
         device=device,
         seed=args.seed,
+        use_real_images=args.use_real_images,
+        data_dir=args.data_dir,
     )
 
 
