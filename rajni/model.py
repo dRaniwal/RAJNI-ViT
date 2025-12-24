@@ -18,6 +18,12 @@ import torch.nn as nn
 if hasattr(torch, '_dynamo'):
     torch._dynamo.config.capture_scalar_outputs = True
 
+# Configure inductor for dynamic shapes (RAJNI has variable token counts)
+# This avoids excessive CUDA graph recordings and related warnings
+if hasattr(torch, '_inductor'):
+    torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+    torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
+
 from .pruning import (
     compute_cls_sensitivity,
     compute_jacobian_importance,
@@ -62,15 +68,15 @@ class AdaptiveJacobianPrunedViT(nn.Module):
     ) -> None:
         super().__init__()
         
-        self.m = model
-        self.blocks = model.blocks
+        # Store base model as a submodule (DataParallel-safe)
+        self.model = model
         
         self.gamma = gamma
         self.min_tokens = min_tokens
         self.eps = eps
         self.collect_stats = collect_stats
         
-        self.num_heads = self.blocks[0].attn.num_heads
+        self.num_heads = model.blocks[0].attn.num_heads
         self.embed_dim = model.embed_dim
         
         self._last_stats: Optional[Dict[str, Any]] = None
@@ -110,20 +116,20 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         B = x.size(0)
         
         # Patch embedding and positional encoding
-        x = self.m.patch_embed(x)
-        x = self.m._pos_embed(x)
-        x = self.m.patch_drop(x)
+        x = self.model.patch_embed(x)
+        x = self.model._pos_embed(x)
+        x = self.model.patch_drop(x)
         
         N = x.size(1) - 1
         
         # Pre-allocate lists (avoid dynamic allocation overhead)
-        num_blocks = len(self.blocks)
+        num_blocks = len(self.model.blocks)
         token_counts: List[int] = [0] * num_blocks
         kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * num_blocks
         
         prev_mass: Optional[torch.Tensor] = None
         
-        for i, blk in enumerate(self.blocks):
+        for i, blk in enumerate(self.model.blocks):
             # Record token count (this is just an int, no GPU sync)
             token_counts[i] = x.size(1)
             
@@ -167,8 +173,8 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             prev_mass = mass
         
         # Final norm and classification head
-        x = self.m.norm(x)
-        logits = self.m.head(x[:, 0])
+        x = self.model.norm(x)
+        logits = self.model.head(x[:, 0])
         
         # Move stats to CPU AFTER forward pass completes (batch all transfers)
         if self.collect_stats:
@@ -190,6 +196,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             f"AdaptiveJacobianPrunedViT("
             f"gamma={self.gamma}, "
             f"min_tokens={self.min_tokens}, "
-            f"num_blocks={len(self.blocks)}, "
+            f"num_blocks={len(self.model.blocks)}, "
             f"embed_dim={self.embed_dim})"
         )
