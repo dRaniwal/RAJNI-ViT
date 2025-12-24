@@ -168,7 +168,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             if prev_mass is not None:
                 keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
                 # .item() is now traced by torch.compile with capture_scalar_outputs=True
-                N_next = max(self.min_tokens, int(N * keep_ratio.item()))
+                N_next = max(self.min_tokens, int(N * keep_ratio))
             else:
                 N_next = N
             
