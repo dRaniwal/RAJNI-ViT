@@ -28,7 +28,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import timm
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional
 
 
 def compute_gradients_with_hooks(
@@ -37,10 +37,10 @@ def compute_gradients_with_hooks(
     target_class: Optional[int] = None,
 ) -> Tuple[List[torch.Tensor], List[Tuple[torch.Tensor, torch.Tensor]]]:
     """
-    Compute exact ∂y/∂CLS_l using register_hook.
+    Compute exact ∂y/∂CLS_l using torch.autograd.grad.
     
-    The key insight: register_hook captures gradients as they flow through
-    the computation graph, without breaking the graph like clone() does.
+    We insert identity operations (multiply by 1) to create computation graph
+    nodes that we can differentiate through.
     
     Args:
         model: timm ViT model
@@ -55,8 +55,7 @@ def compute_gradients_with_hooks(
     
     # Storage for captured data
     attn_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    grad_holders: List[List[Optional[torch.Tensor]]] = []  # Each is [None] to capture
-    hook_handles: List[Any] = []
+    cls_tokens: List[torch.Tensor] = []  # CLS tokens at each layer (in graph)
     
     num_heads = model.blocks[0].attn.num_heads
     head_dim = model.embed_dim // num_heads
@@ -73,21 +72,17 @@ def compute_gradients_with_hooks(
     for i, blk in enumerate(model.blocks):
         B, N, C = h.shape
         
-        # Register hook on CLS token to capture gradient
-        # The hook fires during backward pass
-        cls_token = h[:, 0:1, :]  # Keep dim for proper gradient shape [B, 1, D]
+        # Create a "checkpoint" for the CLS token that stays in the graph
+        # We use an identity operation that creates a leaf we can differentiate
+        cls_checkpoint = h[:, 0, :].clone()  # [B, D]
+        cls_checkpoint.requires_grad_(True)
+        cls_checkpoint.retain_grad()
+        cls_tokens.append(cls_checkpoint)
         
-        grad_holder: List[Optional[torch.Tensor]] = [None]
-        grad_holders.append(grad_holder)
-        
-        def make_hook(holder):
-            def hook(grad):
-                # grad has shape [B, 1, D], squeeze to [B, D]
-                holder[0] = grad[:, 0, :].detach().clone()
-            return hook
-        
-        handle = cls_token.register_hook(make_hook(grad_holder))
-        hook_handles.append(handle)
+        # Reconstruct h with the checkpoint (this keeps it in the graph)
+        h_new = h.clone()
+        h_new[:, 0, :] = cls_checkpoint
+        h = h_new
         
         # Manual attention computation to capture weights
         x_norm = blk.norm1(h)
@@ -112,16 +107,18 @@ def compute_gradients_with_hooks(
         h = h + blk.drop_path1(attn_out)
         h = h + blk.drop_path2(blk.mlp(blk.norm2(h)))
     
-    # Final CLS token hook (after all blocks)
-    final_cls = h[:, 0:1, :]
-    final_grad_holder: List[Optional[torch.Tensor]] = [None]
-    grad_holders.append(final_grad_holder)
+    # Final CLS token checkpoint (after all blocks)
+    final_cls = h[:, 0, :].clone()
+    final_cls.requires_grad_(True)
+    final_cls.retain_grad()
+    cls_tokens.append(final_cls)
     
-    final_handle = final_cls.register_hook(make_hook(final_grad_holder))
-    hook_handles.append(final_handle)
+    # Reconstruct for final layers
+    h_final = h.clone()
+    h_final[:, 0, :] = final_cls
     
     # Classification head
-    h_norm = model.norm(h)
+    h_norm = model.norm(h_final)
     logits = model.head(h_norm[:, 0])
     
     # Select target class
@@ -135,17 +132,16 @@ def compute_gradients_with_hooks(
         # Gather the logits for each sample's target class
         loss = logits.gather(1, target_class.unsqueeze(1)).sum()
     
-    # Backward pass - hooks will capture gradients
-    loss.backward()
+    # Backward pass
+    loss.backward(retain_graph=True)
     
-    # Collect gradients from hooks
+    # Collect gradients
     cls_grads = []
-    for holder in grad_holders:
-        cls_grads.append(holder[0])
-    
-    # Clean up hooks
-    for handle in hook_handles:
-        handle.remove()
+    for cls_token in cls_tokens:
+        if cls_token.grad is not None:
+            cls_grads.append(cls_token.grad.detach().clone())
+        else:
+            cls_grads.append(None)
     
     return cls_grads, attn_values
 
