@@ -254,7 +254,7 @@ def compute_keep_ratio(
     # Adaptive keep ratio with clamping for stability
     # Returns a tensor to avoid GPU-CPU sync
     # ratio_raw =(rho ).clamp(0.25, 1.0) / (gamma)
-    prune_ratio =(rho-0.8)*(gamma).clamp(0.0, 2)
+    # prune_ratio =(rho-0.8)*(gamma).clamp(0.0, 2)
     ratio_raw=min(math.exp(-(rho-0.6)*gamma),1)
     return ratio_raw
 
