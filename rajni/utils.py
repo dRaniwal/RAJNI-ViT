@@ -10,19 +10,33 @@ import torch.nn as nn
 
 def unwrap_model(model: nn.Module) -> nn.Module:
     """
-    Unwrap a model from DataParallel or DistributedDataParallel.
+    Unwrap a model from DataParallel, DistributedDataParallel, and torch.compile.
     
     This is standard practice in research codebases (ToMe, MAE, timm)
     to access the underlying model for statistics and analysis.
+    
+    Handles any combination of wrappers in any order:
+    - compile(DataParallel(model))
+    - DataParallel(compile(model))
+    - compile(model)
+    - DataParallel(model)
+    - model (no wrapper)
     
     Args:
         model: Potentially wrapped PyTorch model
     
     Returns:
-        The underlying model without parallelization wrapper
+        The underlying model without any wrappers
     """
-    if hasattr(model, "module"):
-        return model.module
+    while True:
+        if hasattr(model, '_orig_mod'):
+            # Unwrap torch.compile (OptimizedModule)
+            model = model._orig_mod
+        elif hasattr(model, 'module'):
+            # Unwrap DataParallel or DistributedDataParallel
+            model = model.module
+        else:
+            break
     return model
 
 

@@ -68,19 +68,28 @@ def benchmark(
         throughput: Images per second
         stats: Pruning statistics from last batch
     """
-    # Helper to unwrap model from DataParallel and torch.compile
+    # Helper to unwrap model from DataParallel and torch.compile (any order)
     def _unwrap_model(m):
         """Get the underlying AdaptiveJacobianPrunedViT from wrapped model."""
-        # Unwrap DataParallel
-        if isinstance(m, torch.nn.DataParallel):
-            m = m.module
-        # Unwrap torch.compile (OptimizedModule stores original in _orig_mod)
-        if hasattr(m, '_orig_mod'):
-            m = m._orig_mod
+        # Keep unwrapping until we get to the actual model
+        # Handles: compile(DP(model)), DP(compile(model)), or just model
+        while True:
+            if hasattr(m, '_orig_mod'):
+                # Unwrap torch.compile (OptimizedModule)
+                m = m._orig_mod
+            elif isinstance(m, torch.nn.DataParallel):
+                # Unwrap DataParallel
+                m = m.module
+            else:
+                # No more wrappers
+                break
         return m
     
-    # Handle DataParallel wrapper
-    if not isinstance(model, torch.nn.DataParallel):
+    # Handle DataParallel wrapper (check after potential compile wrapper)
+    unwrapped_for_device = model
+    if hasattr(unwrapped_for_device, '_orig_mod'):
+        unwrapped_for_device = unwrapped_for_device._orig_mod
+    if not isinstance(unwrapped_for_device, torch.nn.DataParallel):
         model.to(device)
     model.eval()
     
