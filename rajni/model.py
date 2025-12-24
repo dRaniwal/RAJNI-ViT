@@ -7,7 +7,6 @@ token pruning to any timm-compatible Vision Transformer.
 from typing import Dict, List, Optional, Any
 import torch
 import torch.nn as nn
-from torch.amp import autocast
 
 from .pruning import (
     compute_cls_sensitivity,
@@ -94,10 +93,10 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         """Forward pass with adaptive token pruning."""
         B = x.size(0)
         
-        with autocast(device_type="cuda"):
-            x = self.m.patch_embed(x)
-            x = self.m._pos_embed(x)
-            x = self.m.patch_drop(x)
+        # Patch embedding and positional encoding
+        x = self.m.patch_embed(x)
+        x = self.m._pos_embed(x)
+        x = self.m.patch_drop(x)
         
         N = x.size(1) - 1
         
@@ -110,13 +109,13 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             # This is the actual number of tokens this layer computes on
             token_counts.append(x.size(1))
             
-            with autocast(device_type="cuda"):
-                x_norm = blk.norm1(x)
-                attn, v, attn_out = self._extract_attention_values(
-                    x_norm, blk.attn, B, x.size(1)
-                )
-                x = x + blk.drop_path1(attn_out)
-                x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
+            # Process through attention and MLP
+            x_norm = blk.norm1(x)
+            attn, v, attn_out = self._extract_attention_values(
+                x_norm, blk.attn, B, x.size(1)
+            )
+            x = x + blk.drop_path1(attn_out)
+            x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
             
             if N <= self.min_tokens:
                 continue
@@ -138,9 +137,9 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             
             prev_mass = mass
         
-        with autocast(device_type="cuda"):
-            x = self.m.norm(x)
-            logits = self.m.head(x[:, 0])
+        # Final norm and classification head
+        x = self.m.norm(x)
+        logits = self.m.head(x[:, 0])
         
         self._last_stats = {
             "token_counts": token_counts,

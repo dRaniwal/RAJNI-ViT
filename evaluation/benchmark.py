@@ -2,6 +2,9 @@
 Benchmarking utilities for RAJNI models.
 
 Provides accuracy and throughput evaluation for pruned models.
+
+Note on timing: We use torch.cuda.Event for accurate GPU timing,
+which avoids host-device synchronization overhead that affects time.time().
 """
 import time
 from typing import Dict, Any, Optional, Tuple
@@ -11,13 +14,40 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+def _warmup_model(model: nn.Module, dataloader: DataLoader, device: str, num_batches: int = 10):
+    """
+    Warmup model to ensure CUDA kernels are compiled and cached.
+    
+    This is critical for fair benchmarking - the first few forward passes
+    are always slower due to JIT compilation and memory allocation.
+    """
+    model.eval()
+    data_iter = iter(dataloader)
+    
+    with torch.no_grad():
+        for i in range(num_batches):
+            try:
+                images, _ = next(data_iter)
+            except StopIteration:
+                data_iter = iter(dataloader)
+                images, _ = next(data_iter)
+            
+            images = images.to(device, non_blocking=True)
+            _ = model(images)
+    
+    # Ensure all warmup operations complete
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+
 @torch.no_grad()
 def benchmark(
     model: nn.Module,
     dataloader: DataLoader,
     device: str = "cuda",
-    warmup: int = 5,
+    warmup: int = 10,
     max_batches: Optional[int] = None,
+    use_cuda_events: bool = True,
 ) -> Tuple[float, float, Optional[Dict[str, Any]]]:
     """
     Benchmark a RAJNI-wrapped model for accuracy and throughput.
@@ -31,9 +61,10 @@ def benchmark(
         device: Target device ("cuda" or "cpu")
         warmup: Number of warmup batches (not timed)
         max_batches: Maximum batches to process (None = all)
+        use_cuda_events: Use CUDA events for timing (more accurate)
     
     Returns:
-        accuracy: Top-1 accuracy (0.0 to 1.0)
+        accuracy: Top-1 accuracy as percentage
         throughput: Images per second
         stats: Pruning statistics from last batch
     """
@@ -42,11 +73,20 @@ def benchmark(
         model.to(device)
     model.eval()
     
+    # Dedicated warmup phase
+    print(f"  Warming up ({warmup} batches)...")
+    _warmup_model(model, dataloader, device, warmup)
+    
     correct = 0
     total = 0
     total_images = 0
     total_time = 0.0
     last_stats = None
+    
+    # CUDA events for accurate timing
+    if use_cuda_events and device == "cuda":
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
     
     pbar = tqdm(dataloader, desc="RAJNI Benchmark", leave=False)
     
@@ -57,9 +97,11 @@ def benchmark(
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         
-        # Warmup phase (not timed)
-        if i >= warmup:
-            torch.cuda.synchronize()
+        # Timing with CUDA events (more accurate than time.time)
+        if use_cuda_events and device == "cuda":
+            start_event.record()
+        else:
+            torch.cuda.synchronize() if device == "cuda" else None
             start = time.time()
         
         logits = model(images)
@@ -70,10 +112,17 @@ def benchmark(
         else:
             last_stats = model.get_last_stats()
         
-        if i >= warmup:
+        # End timing
+        if use_cuda_events and device == "cuda":
+            end_event.record()
             torch.cuda.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
+            total_time += elapsed_ms / 1000.0
+        else:
+            torch.cuda.synchronize() if device == "cuda" else None
             total_time += time.time() - start
-            total_images += images.size(0)
+        
+        total_images += images.size(0)
         
         predictions = logits.argmax(dim=1)
         correct += (predictions == labels).sum().item()
