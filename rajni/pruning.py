@@ -95,8 +95,9 @@ def compute_cls_sensitivity(
     
     # Apply calibration if enabled
     if calibrate:
+        # Apply calibration per sample
         rho_calib = calibrate_rho(rho_raw, layer_idx)
-        return rho_calib.mean()
+        return rho_calib  # Return per-sample calibrated rho
     return rho_raw
 
 
@@ -110,7 +111,7 @@ def compute_jacobian_importance(
     Compute Jacobian-based importance scores for patch tokens.
     
     We approximate the Jacobian of CLS w.r.t. patches as:
-        J_i ≈ A[cls→i] * ||V_i - mean(V)||
+        J_i ≈ A[cls→i] * ||V_i - mean(V||
     
     This captures both attention flow (which patches CLS attends to)
     and value saliency (which patches have distinctive features).
