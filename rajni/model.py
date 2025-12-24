@@ -75,23 +75,9 @@ class AdaptiveJacobianPrunedViT(nn.Module):
     ) -> None:
         super().__init__()
         
-        # Store base model components directly as submodules for DataParallel compatibility
-        # DataParallel replicates registered submodules, so we register each component
-        self.patch_embed = model.patch_embed
-        self.blocks = model.blocks
-        self.norm = model.norm
-        self.head = model.head
-        
-        # Store the _pos_embed method (it's a bound method, not a module)
-        # We need to handle pos_embed specially since it accesses model attributes
-        self.cls_token = model.cls_token
-        self.pos_embed = model.pos_embed
-        self.pos_drop = model.pos_drop if hasattr(model, 'pos_drop') else nn.Identity()
-        self.patch_drop = model.patch_drop if hasattr(model, 'patch_drop') else nn.Identity()
-        
-        # Store whether model uses register tokens (newer timm models)
-        self.num_prefix_tokens = getattr(model, 'num_prefix_tokens', 1)
-        self.no_embed_class = getattr(model, 'no_embed_class', False)
+        # Register the base model as a submodule using add_module
+        # This ensures proper replication with DataParallel
+        self.add_module('base_model', model)
         
         self.gamma = gamma
         self.min_tokens = min_tokens
@@ -107,7 +93,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         """Get statistics from the last forward pass."""
         return self._last_stats
 
-    @torch.no_grad()
     def _extract_attention_values(
         self,
         x_norm: torch.Tensor,
@@ -133,37 +118,28 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         
         return attn, v, out
 
-    def _pos_embed(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply positional embedding (reimplemented to avoid model reference)."""
-        if self.no_embed_class:
-            # Positional embed without class token
-            x = x + self.pos_embed
-            x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-        else:
-            # Standard: class token + positional embed
-            x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
-            x = x + self.pos_embed
-        return self.pos_drop(x)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with adaptive token pruning."""
         B = x.size(0)
         
+        # Access base model components
+        m = self.base_model
+        
         # Patch embedding and positional encoding
-        x = self.patch_embed(x)
-        x = self._pos_embed(x)
-        x = self.patch_drop(x)
+        x = m.patch_embed(x)
+        x = m._pos_embed(x)
+        x = m.patch_drop(x)
         
         N = x.size(1) - 1
         
         # Pre-allocate lists (avoid dynamic allocation overhead)
-        num_blocks = len(self.blocks)
+        num_blocks = len(m.blocks)
         token_counts: List[int] = [0] * num_blocks
         kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * num_blocks
         
         prev_mass: Optional[torch.Tensor] = None
         
-        for i, blk in enumerate(self.blocks):
+        for i, blk in enumerate(m.blocks):
             # Record token count (this is just an int, no GPU sync)
             token_counts[i] = x.size(1)
             
@@ -207,8 +183,8 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             prev_mass = mass
         
         # Final norm and classification head
-        x = self.norm(x)
-        logits = self.head(x[:, 0])
+        x = m.norm(x)
+        logits = m.head(x[:, 0])
         
         # Move stats to CPU AFTER forward pass completes (batch all transfers)
         if self.collect_stats:
@@ -230,6 +206,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             f"AdaptiveJacobianPrunedViT("
             f"gamma={self.gamma}, "
             f"min_tokens={self.min_tokens}, "
-            f"num_blocks={len(self.blocks)}, "
+            f"num_blocks={len(self.base_model.blocks)}, "
             f"embed_dim={self.embed_dim})"
         )
