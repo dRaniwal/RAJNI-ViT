@@ -13,6 +13,11 @@ from typing import Dict, List, Optional, Any
 import torch
 import torch.nn as nn
 
+# Enable scalar output capture for torch.compile compatibility
+# This allows .item() calls to be traced without graph breaks
+if hasattr(torch, '_dynamo'):
+    torch._dynamo.config.capture_scalar_outputs = True
+
 from .pruning import (
     compute_cls_sensitivity,
     compute_jacobian_importance,
@@ -139,9 +144,10 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             rho = compute_cls_sensitivity(attn, v)
             importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
             
-            # Adaptive keep ratio (stays on GPU)
+            # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
             if prev_mass is not None:
                 keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
+                # .item() is now traced by torch.compile with capture_scalar_outputs=True
                 N_next = max(self.min_tokens, int(N * keep_ratio.item()))
             else:
                 N_next = N
