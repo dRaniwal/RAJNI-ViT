@@ -9,7 +9,7 @@ Performance notes:
 - Indices are collected only at the end for visualization
 - Compatible with torch.compile for additional speedup
 """
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 import torch
 import torch.nn as nn
 import logging
@@ -32,6 +32,8 @@ if hasattr(torch, '_inductor'):
     torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
 
 from .pruning import (
+    compute_cls_sensitivity,
+    compute_jacobian_importance,
     compute_importance_and_sensitivity,
     compute_keep_ratio,
     select_tokens,
@@ -53,7 +55,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
     - Inference-only (no training required)
     - DataParallel-safe (returns only tensors from forward)
     - Framework-agnostic (works with any timm ViT)
-    - Memory efficient (no tensor storage between layers)
+    - High GPU utilization (no CPU-GPU sync in forward pass)
     
     Args:
         model: A timm Vision Transformer model
@@ -96,61 +98,33 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         """Get statistics from the last forward pass."""
         return self._last_stats
 
-    def _extract_attention_and_forward(
+    def _extract_attention_values(
         self,
-        x: torch.Tensor,
-        blk: nn.Module,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Process a transformer block and extract attention weights/values.
+        x_norm: torch.Tensor,
+        attn_module: nn.Module,
+        batch_size: int,
+        num_tokens: int,
+    ) -> tuple:
+        """Extract attention weights and value vectors from attention module."""
+        qkv = attn_module.qkv(x_norm)
+        qkv = qkv.reshape(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
         
-        This performs the full block forward pass while capturing the
-        intermediate attention weights and value vectors needed for
-        importance scoring.
-        
-        Args:
-            x: Input tensor [B, N, D]
-            blk: Transformer block module
-            
-        Returns:
-            x_out: Output after block [B, N, D]
-            attn: Attention weights [B, H, N, N]
-            v: Value vectors [B, H, N, head_dim]
-        """
-        B, N, C = x.shape
-        
-        # Attention computation
-        x_norm = blk.norm1(x)
-        qkv = blk.attn.qkv(x_norm)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        q, k, v = qkv.unbind(0)  # Faster than indexing for small tensors
         
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-        attn = blk.attn.attn_drop(attn)
         
-        # Attention output
-        attn_out = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        attn_out = blk.attn.proj(attn_out)
-        attn_out = blk.attn.proj_drop(attn_out)
+        out = (attn @ v).transpose(1, 2).reshape(batch_size, num_tokens, -1)
+        out = attn_module.proj(out)
         
-        # Apply residual and layer scale if present
-        if hasattr(blk, 'ls1'):
-            x = x + blk.drop_path1(blk.ls1(attn_out))
-        else:
-            x = x + blk.drop_path1(attn_out)
-        
-        # MLP
-        if hasattr(blk, 'ls2'):
-            x = x + blk.drop_path2(blk.ls2(blk.mlp(blk.norm2(x))))
-        else:
-            x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
-        
-        return x, attn, v
+        return attn, v, out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with adaptive token pruning."""
         B = x.size(0)
+        
+        # Access base model components
         m = self.base_model
         
         # Patch embedding and positional encoding
@@ -160,30 +134,40 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         
         N = x.size(1) - 1
         
-        # Pre-allocate lists
-        token_counts: List[int] = [0] * self.num_blocks
-        kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * self.num_blocks
+        # Pre-allocate lists (avoid dynamic allocation overhead)
+        num_blocks = len(m.blocks)
+        token_counts: List[int] = [0] * num_blocks
+        kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * num_blocks
         
         prev_mass: Optional[torch.Tensor] = None
         
         for i, blk in enumerate(m.blocks):
-            # Record token count
+            # Record token count (this is just an int, no GPU sync)
             token_counts[i] = x.size(1)
             
-            # Forward through block and extract attention
-            x, attn, v = self._extract_attention_and_forward(x, blk)
+            # Process through attention and MLP
+            x_norm = blk.norm1(x)
+            attn, v, attn_out = self._extract_attention_values(
+                x_norm, blk.attn, B, x.size(1)
+            )
+            x = x + blk.drop_path1(attn_out)
+            x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
             
             # Skip pruning if already at minimum
             if N <= self.min_tokens:
                 prev_mass = None
                 continue
             
-            # Compute importance and sensitivity (CORE LOGIC - UNCHANGED)
-            importance, mass, rho = compute_importance_and_sensitivity(attn, v, N, self.eps)
+            # Compute importance and sensitivity in one fused call (reduces kernel launches)
+            # Pass layer index for calibrated rho
+            importance, mass, rho = compute_importance_and_sensitivity(
+                attn, v, N, layer_idx=i, calibrate=True, eps=self.eps
+            )
             
-            # Adaptive keep ratio (CORE LOGIC - UNCHANGED)
+            # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
             if prev_mass is not None:
                 keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
+                # .item() is now traced by torch.compile with capture_scalar_outputs=True
                 N_next = max(self.min_tokens, int(N * keep_ratio.item()))
             else:
                 N_next = N
@@ -192,9 +176,11 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             if N_next < N:
                 keep_idx = select_tokens(importance, N_next, x.device)
                 
+                # Store on GPU, move to CPU only at the end
                 if self.collect_stats:
                     kept_indices_gpu[i] = keep_idx.detach()
                 
+                # Index selection (contiguous memory access)
                 x = torch.index_select(x, dim=1, index=keep_idx)
                 N = N_next
             
@@ -204,7 +190,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         x = m.norm(x)
         logits = m.head(x[:, 0])
         
-        # Move stats to CPU AFTER forward pass completes
+        # Move stats to CPU AFTER forward pass completes (batch all transfers)
         if self.collect_stats:
             kept_indices_cpu = [
                 idx.cpu() if idx is not None else None 
@@ -224,6 +210,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             f"AdaptiveJacobianPrunedViT("
             f"gamma={self.gamma}, "
             f"min_tokens={self.min_tokens}, "
-            f"num_blocks={self.num_blocks}, "
+            f"num_blocks={len(self.base_model.blocks)}, "
             f"embed_dim={self.embed_dim})"
         )

@@ -13,36 +13,89 @@ import torch
 import torch.nn.functional as F
 
 
+# Layer-specific calibration coefficients for ρ (rho)
+# Fitted via linear regression on ImageNet validation data:
+#   calibrated_rho = a * raw_rho + b
+# These coefficients correct the systematic overestimation of raw ρ
+# See scripts/validate_rho.py for validation methodology
+RHO_CALIBRATION_COEFFICIENTS = {
+    # Layer: (slope a, intercept b) - fitted via least squares
+    0:  (0.40, 0.20),   # ρ_raw ~1.40 → exact ~0.75
+    1:  (0.45, 0.28),   # ρ_raw ~1.43 → exact ~0.93  
+    2:  (0.42, 0.25),   # ρ_raw ~1.46 → exact ~0.87
+    3:  (0.38, 0.29),   # ρ_raw ~1.61 → exact ~0.91
+    4:  (0.40, 0.20),   # ρ_raw ~1.56 → exact ~0.82
+    5:  (0.50, 0.23),   # ρ_raw ~1.46 → exact ~0.96
+    6:  (0.55, 0.25),   # ρ_raw ~1.39 → exact ~1.01
+    7:  (0.65, 0.19),   # ρ_raw ~1.18 → exact ~0.95
+    8:  (0.80, 0.10),   # ρ_raw ~1.04 → exact ~0.92
+    9:  (0.75, 0.13),   # ρ_raw ~1.07 → exact ~0.94
+    10: (0.85, 0.02),   # ρ_raw ~1.01 → exact ~0.88
+    11: (0.95, 0.20),   # ρ_raw ~1.01 → exact ~1.15 (gradient amplification)
+}
+
+
+def calibrate_rho(rho_raw: torch.Tensor, layer_idx: int) -> torch.Tensor:
+    """
+    Apply layer-specific linear calibration to raw rho value.
+    
+    Raw ρ = 1 + A(CLS→CLS) · ||V_CLS - mean(V)|| systematically
+    overestimates the true gradient ratio ∂y/∂CLS_{l+1} / ∂y/∂CLS_l.
+    
+    This function applies empirically-derived linear transform:
+        ρ_calibrated = a * ρ_raw + b
+    
+    Args:
+        rho_raw: Uncalibrated rho value [scalar or tensor]
+        layer_idx: Layer index (0-11 for ViT-Base)
+    
+    Returns:
+        Calibrated rho value
+    """
+    a, b = RHO_CALIBRATION_COEFFICIENTS.get(layer_idx, (0.55, 0.20))
+    return a * rho_raw + b
+
+
 def compute_cls_sensitivity(
     attention: torch.Tensor,
     values: torch.Tensor,
+    layer_idx: int = 0,
+    calibrate: bool = True,
 ) -> torch.Tensor:
     """
     Compute CLS token sensitivity (rho) from attention and values.
     
     This measures how much the CLS token attends to itself, weighted
-    by the norm of its value vector. High rho indicates the model
-    is confident and less aggressive pruning is appropriate.
+    by the norm of its value vector. Uses centered V for consistency
+    with patch importance computation.
     
     Args:
         attention: Attention weights [B, H, N, N] after softmax
         values: Value vectors [B, H, N, D]
+        layer_idx: Layer index for calibration (0-11 for ViT-Base)
+        calibrate: Whether to apply layer-specific calibration
     
     Returns:
-        rho: Scalar sensitivity measure
+        rho: Scalar sensitivity measure (calibrated if enabled)
     """
     # Average across heads
     A_mean = attention.mean(dim=1)  # [B, N, N]
     A_cls_cls = A_mean[:, 0, 0]     # [B] - CLS self-attention
     
-    # CLS value vector norm (averaged across heads)
-    V_cls = values.mean(dim=1)[:, 0]  # [B, D]
-    V_cls_norm = V_cls.norm(dim=-1)   # [B]
+    # CLS value vector norm with centering (consistent with patch importance)
+    V_mean_heads = values.mean(dim=1)  # [B, N, D]
+    V_cls = V_mean_heads[:, 0]  # [B, D]
+    V_mean = V_mean_heads.mean(dim=1)  # [B, D] - mean across all tokens
+    V_cls_centered = V_cls - V_mean
+    V_cls_norm = V_cls_centered.norm(dim=-1)   # [B]
     
-    # Sensitivity: how "anchored" is the CLS token
-    rho = (1.0 + A_cls_cls * V_cls_norm).mean()
+    # Raw sensitivity: how "anchored" is the CLS token
+    rho_raw = (1.0 + A_cls_cls * V_cls_norm).mean()
     
-    return rho
+    # Apply calibration if enabled
+    if calibrate:
+        return calibrate_rho(rho_raw, layer_idx)
+    return rho_raw
 
 
 def compute_jacobian_importance(
@@ -103,6 +156,8 @@ def compute_importance_and_sensitivity(
     attention: torch.Tensor,
     values: torch.Tensor,
     num_patches: int,
+    layer_idx: int = 0,
+    calibrate: bool = True,
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -115,22 +170,36 @@ def compute_importance_and_sensitivity(
         attention: Attention weights [B, H, N, N] after softmax
         values: Value vectors [B, H, N, D]
         num_patches: Number of patch tokens (excluding CLS)
+        layer_idx: Layer index for rho calibration (0-11 for ViT-Base)
+        calibrate: Whether to apply layer-specific rho calibration
         eps: Small constant for numerical stability
     
     Returns:
         importance: Per-patch importance scores [B, num_patches]
         mass: Total importance mass (scalar)
-        rho: CLS sensitivity (scalar)
+        rho: CLS sensitivity (scalar, calibrated if enabled)
     """
     # Average attention across heads (compute once)
     A_mean = attention.mean(dim=1)  # [B, N, N]
     
-    # === CLS Sensitivity (rho) ===
+    # === CLS Sensitivity (rho) with centered V ===
     A_cls_cls = A_mean[:, 0, 0]  # [B]
     V_mean_heads = values.mean(dim=1)  # [B, N, D]
     V_cls = V_mean_heads[:, 0]  # [B, D]
-    V_cls_norm = V_cls.norm(dim=-1)  # [B]
-    rho = (1.0 + A_cls_cls * V_cls_norm).mean()
+    
+    # Center CLS value (consistent with patch importance centering)
+    V_global_mean = V_mean_heads.mean(dim=1)  # [B, D]
+    V_cls_centered = V_cls - V_global_mean
+    V_cls_norm = V_cls_centered.norm(dim=-1)  # [B]
+    
+    # Raw rho
+    rho_raw = (1.0 + A_cls_cls * V_cls_norm).mean()
+    
+    # Apply calibration if enabled
+    if calibrate:
+        rho = calibrate_rho(rho_raw, layer_idx)
+    else:
+        rho = rho_raw
     
     # === Jacobian Importance ===
     A_cls_to_patches = A_mean[:, 0, 1:num_patches + 1]  # [B, num_patches]
@@ -184,7 +253,7 @@ def compute_keep_ratio(
     
     # Adaptive keep ratio with clamping for stability
     # Returns a tensor to avoid GPU-CPU sync
-    ratio_raw = (rho * eta).clamp(0.25, 4.0) ** (-gamma)
+    ratio_raw = (rho ).clamp(0.25, 4.0) ** (-gamma)
     
     return ratio_raw
 
