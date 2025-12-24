@@ -198,7 +198,7 @@ def compute_importance_and_sensitivity(
     
     # Apply calibration if enabled
 
-    rho = calibrate_rho(rho_raw, layer_idx)
+    rho = calibrate_rho(rho_raw, layer_idx).mean()
 
     
     # === Jacobian Importance ===
