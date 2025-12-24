@@ -75,9 +75,30 @@ class AdaptiveJacobianPrunedViT(nn.Module):
     ) -> None:
         super().__init__()
         
-        # Register the base model as a submodule using add_module
-        # This ensures proper replication with DataParallel
-        self.add_module('base_model', model)
+        # Store model components directly as registered submodules
+        # This is more robust with torch.compile + DataParallel
+        self._modules['patch_embed'] = model.patch_embed
+        self._modules['blocks'] = model.blocks
+        self._modules['norm'] = model.norm
+        self._modules['head'] = model.head
+        
+        # Store parameters/buffers for positional embedding
+        self.register_buffer('pos_embed', model.pos_embed.clone())
+        self.register_buffer('cls_token', model.cls_token.clone())
+        
+        # Optional components (may not exist in all timm versions)
+        if hasattr(model, 'pos_drop'):
+            self._modules['pos_drop'] = model.pos_drop
+        else:
+            self._modules['pos_drop'] = nn.Identity()
+            
+        if hasattr(model, 'patch_drop'):
+            self._modules['patch_drop'] = model.patch_drop
+        else:
+            self._modules['patch_drop'] = nn.Identity()
+        
+        # Store config for positional embedding
+        self.no_embed_class = getattr(model, 'no_embed_class', False)
         
         self.gamma = gamma
         self.min_tokens = min_tokens
@@ -118,28 +139,36 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         
         return attn, v, out
 
+    def _pos_embed(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply positional embedding."""
+        B = x.shape[0]
+        if self.no_embed_class:
+            x = x + self.pos_embed
+            x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1)
+        else:
+            x = torch.cat((self.cls_token.expand(B, -1, -1), x), dim=1)
+            x = x + self.pos_embed
+        return self.pos_drop(x)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with adaptive token pruning."""
         B = x.size(0)
         
-        # Access base model components
-        m = self.base_model
-        
-        # Patch embedding and positional encoding
-        x = m.patch_embed(x)
-        x = m._pos_embed(x)
-        x = m.patch_drop(x)
+        # Patch embedding and positional encoding (use self.* directly)
+        x = self.patch_embed(x)
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
         
         N = x.size(1) - 1
         
         # Pre-allocate lists (avoid dynamic allocation overhead)
-        num_blocks = len(m.blocks)
+        num_blocks = len(self.blocks)
         token_counts: List[int] = [0] * num_blocks
         kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * num_blocks
         
         prev_mass: Optional[torch.Tensor] = None
         
-        for i, blk in enumerate(m.blocks):
+        for i, blk in enumerate(self.blocks):
             # Record token count (this is just an int, no GPU sync)
             token_counts[i] = x.size(1)
             
@@ -183,8 +212,8 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             prev_mass = mass
         
         # Final norm and classification head
-        x = m.norm(x)
-        logits = m.head(x[:, 0])
+        x = self.norm(x)
+        logits = self.head(x[:, 0])
         
         # Move stats to CPU AFTER forward pass completes (batch all transfers)
         if self.collect_stats:
@@ -206,6 +235,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             f"AdaptiveJacobianPrunedViT("
             f"gamma={self.gamma}, "
             f"min_tokens={self.min_tokens}, "
-            f"num_blocks={len(self.base_model.blocks)}, "
+            f"num_blocks={len(self.blocks)}, "
             f"embed_dim={self.embed_dim})"
         )

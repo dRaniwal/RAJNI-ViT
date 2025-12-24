@@ -68,6 +68,17 @@ def benchmark(
         throughput: Images per second
         stats: Pruning statistics from last batch
     """
+    # Helper to unwrap model from DataParallel and torch.compile
+    def _unwrap_model(m):
+        """Get the underlying AdaptiveJacobianPrunedViT from wrapped model."""
+        # Unwrap DataParallel
+        if isinstance(m, torch.nn.DataParallel):
+            m = m.module
+        # Unwrap torch.compile (OptimizedModule stores original in _orig_mod)
+        if hasattr(m, '_orig_mod'):
+            m = m._orig_mod
+        return m
+    
     # Handle DataParallel wrapper
     if not isinstance(model, torch.nn.DataParallel):
         model.to(device)
@@ -106,11 +117,9 @@ def benchmark(
         
         logits = model(images)
         
-        # Retrieve stats (DataParallel-safe)
-        if isinstance(model, torch.nn.DataParallel):
-            last_stats = model.module.get_last_stats()
-        else:
-            last_stats = model.get_last_stats()
+        # Retrieve stats (handles DataParallel + torch.compile)
+        unwrapped = _unwrap_model(model)
+        last_stats = unwrapped.get_last_stats()
         
         # End timing
         if use_cuda_events and device == "cuda":
