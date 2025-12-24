@@ -213,6 +213,10 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             attn = self._attn_storage[i]['attn']
             v = self._attn_storage[i]['v']
             
+            # Clear storage immediately to free memory
+            self._attn_storage[i]['attn'] = None
+            self._attn_storage[i]['v'] = None
+            
             # Skip pruning if already at minimum
             if N <= self.min_tokens:
                 prev_mass = None
