@@ -157,14 +157,14 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 continue
             
             # Compute importance scores (all on GPU)
-            rho = compute_cls_sensitivity(attn, i, v)
+            rho = compute_cls_sensitivity(attn, v, layer_idx=i)
             importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
             
             # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
             if prev_mass is not None:
                 keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
                 # .item() is now traced by torch.compile with capture_scalar_outputs=True
-                N_next = max(self.min_tokens, int(N * keep_ratio))
+                N_next = max(self.min_tokens, int(N * keep_ratio.item()))
             else:
                 N_next = N
             
