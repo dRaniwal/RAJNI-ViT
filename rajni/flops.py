@@ -1,19 +1,31 @@
 def baseline_vit_flops(model, tokens):
     """
-    Approximate baseline ViT FLOPs per forward.
+    Proper ViT FLOPs: Attention + FFN
     """
     L = len(model.blocks)
     D = model.embed_dim
-    return L * (tokens ** 2) * D
+
+    flops_per_layer = (
+        12 * tokens * D * D +   # QKV + proj + FFN
+        2 * tokens * tokens * D
+    )
+
+    return L * flops_per_layer
 
 
 def adaptive_vit_flops(token_counts, embed_dim):
     """
-    FLOPs used by RAJNI based on token counts.
+    FLOPs used by RAJNI based on per-layer token counts.
     """
+    D = embed_dim
     flops = 0
-    for t in token_counts:
-        flops += (t ** 2) * embed_dim
+
+    for N in token_counts:
+        flops += (
+            12 * N * D * D +
+            2 * N * N * D
+        )
+
     return flops
 
 
