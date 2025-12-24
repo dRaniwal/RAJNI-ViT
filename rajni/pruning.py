@@ -99,6 +99,60 @@ def compute_jacobian_importance(
     return importance, mass
 
 
+def compute_importance_and_sensitivity(
+    attention: torch.Tensor,
+    values: torch.Tensor,
+    num_patches: int,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fused computation of both importance scores and CLS sensitivity.
+    
+    This combines compute_cls_sensitivity and compute_jacobian_importance
+    to reduce redundant operations (A_mean computed once).
+    
+    Args:
+        attention: Attention weights [B, H, N, N] after softmax
+        values: Value vectors [B, H, N, D]
+        num_patches: Number of patch tokens (excluding CLS)
+        eps: Small constant for numerical stability
+    
+    Returns:
+        importance: Per-patch importance scores [B, num_patches]
+        mass: Total importance mass (scalar)
+        rho: CLS sensitivity (scalar)
+    """
+    # Average attention across heads (compute once)
+    A_mean = attention.mean(dim=1)  # [B, N, N]
+    
+    # === CLS Sensitivity (rho) ===
+    A_cls_cls = A_mean[:, 0, 0]  # [B]
+    V_mean_heads = values.mean(dim=1)  # [B, N, D]
+    V_cls = V_mean_heads[:, 0]  # [B, D]
+    V_cls_norm = V_cls.norm(dim=-1)  # [B]
+    rho = (1.0 + A_cls_cls * V_cls_norm).mean()
+    
+    # === Jacobian Importance ===
+    A_cls_to_patches = A_mean[:, 0, 1:num_patches + 1]  # [B, num_patches]
+    V_patches = V_mean_heads[:, 1:num_patches + 1]  # [B, num_patches, D]
+    
+    # Center and normalize value vectors
+    V_patch_mean = V_patches.mean(dim=1, keepdim=True)
+    V_centered = V_patches - V_patch_mean
+    V_norm = V_centered.norm(dim=-1)  # [B, num_patches]
+    
+    # Standardize
+    mu = V_norm.mean(dim=1, keepdim=True)
+    std = V_norm.std(dim=1, keepdim=True)
+    V_standardized = (V_norm - mu) / (std + eps)
+    
+    # Importance = attention * ReLU(standardized value norm)
+    importance = A_cls_to_patches * F.relu(V_standardized)
+    mass = importance.sum(dim=1).mean()
+    
+    return importance, mass, rho
+
+
 def compute_keep_ratio(
     rho: torch.Tensor,
     current_mass: torch.Tensor,

@@ -35,7 +35,7 @@ def _unwrap_model(m):
     return m
 
 
-def _warmup_model(model: nn.Module, dataloader: DataLoader, device: str, num_batches: int = 10):
+def _warmup_model(model: nn.Module, dataloader: DataLoader, device: str, num_batches: int = 5):
     """
     Warmup model to ensure CUDA kernels are compiled and cached.
     """
