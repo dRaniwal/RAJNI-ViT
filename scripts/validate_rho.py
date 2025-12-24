@@ -151,24 +151,31 @@ def compute_rajni_rho(
     values: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Compute RAJNI's ρ approximation: 1 + A(CLS→CLS) · ||V_CLS||
+    Compute RAJNI's ρ approximation: 1 + A(CLS→CLS) · ||V_CLS - mean(V)||
+    
+    Uses centered V (like patch importance) for consistency.
     
     Args:
         attn: Attention weights [B, H, N, N]
         values: Value vectors [B, H, N, D]
     
     Returns:
-        rho: Scalar approximation
+        rho: Per-sample approximation [B]
     """
     # Average across heads
     A_mean = attn.mean(dim=1)  # [B, N, N]
     A_cls_cls = A_mean[:, 0, 0]  # [B] - CLS self-attention
     
-    # CLS value vector norm (averaged across heads)
-    V_cls = values.mean(dim=1)[:, 0]  # [B, D]
-    V_cls_norm = V_cls.norm(dim=-1)   # [B]
+    # CLS value vector (averaged across heads)
+    V_mean = values.mean(dim=1)  # [B, N, D]
+    V_cls = V_mean[:, 0]  # [B, D]
     
-    # RAJNI approximation
+    # Center V_cls by subtracting mean across all tokens (like patch importance)
+    V_all_mean = V_mean.mean(dim=1)  # [B, D] - mean across all tokens
+    V_cls_centered = V_cls - V_all_mean  # [B, D]
+    V_cls_norm = V_cls_centered.norm(dim=-1)  # [B]
+    
+    # RAJNI approximation with centered V
     rho = 1.0 + A_cls_cls * V_cls_norm
     
     return rho
