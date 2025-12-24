@@ -12,6 +12,13 @@ Performance notes:
 from typing import Dict, List, Optional, Any
 import torch
 import torch.nn as nn
+import logging
+
+# Suppress verbose torch.compile warnings for dynamic shapes
+# RAJNI has variable token counts which triggers many symbolic shape warnings
+logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
+logging.getLogger("torch.fx.experimental.symbolic_shapes").setLevel(logging.ERROR)
 
 # Enable scalar output capture for torch.compile compatibility
 # This allows .item() calls to be traced without graph breaks
