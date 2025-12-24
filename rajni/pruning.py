@@ -11,7 +11,7 @@ expensive backpropagation during inference.
 from typing import Tuple, Optional
 import torch
 import torch.nn.functional as F
-
+import math
 
 # Layer-specific calibration coefficients for ρ (rho)
 # Fitted via linear regression on ImageNet validation data:
@@ -254,8 +254,8 @@ def compute_keep_ratio(
     # Adaptive keep ratio with clamping for stability
     # Returns a tensor to avoid GPU-CPU sync
     # ratio_raw =(rho ).clamp(0.25, 1.0) / (gamma)
-    prune_ratio =(rho-0.8)*(gamma)
-    ratio_raw=(1-prune_ratio).clamp(0.5, 1.0)
+    prune_ratio =(rho-0.8)*(gamma).clamp(0.0, 2)
+    ratio_raw=min(math.exp(-(rho-0.6)*gamma),1)
     return ratio_raw
 
 
