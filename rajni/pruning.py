@@ -52,7 +52,6 @@ def calibrate_rho(rho_raw: torch.Tensor, layer_idx: int) -> torch.Tensor:
 def compute_cls_sensitivity(
     attention: torch.Tensor,
     values: torch.Tensor,
-    *,
     layer_idx: int = 0,
 ) -> torch.Tensor:
     """
