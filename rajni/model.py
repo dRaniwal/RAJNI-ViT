@@ -164,9 +164,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 attn, v, N, layer_idx=i, calibrate=True, eps=self.eps
             )
             
-            # Debugging: Print calibrated rho values
-            print(f"Layer {i}: rho = {rho}")
-            
             # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
             if prev_mass is not None:
                 
