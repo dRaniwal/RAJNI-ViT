@@ -92,7 +92,7 @@ def compute_cls_sensitivity(
 
     # Raw sensitivity: how "anchored" is the CLS token
     rho_raw = (1.0 + A_cls_cls * V_cls_norm)
-    
+    print(f"Layer {layer_idx}: rho_raw = {rho_raw}")
     # Apply calibration if enabled
     if calibrate:
         # Apply calibration per sample

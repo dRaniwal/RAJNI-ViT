@@ -423,6 +423,9 @@ def validate_rho(
             rho_raw = compute_rajni_rho_raw(attn, v).mean().item()
             rho_calib = compute_rajni_rho(attn, v, layer_idx=layer).mean().item()
             
+            # Debugging print statement for raw rho values
+            print(f"Layer {layer}: rho_raw = {rho_raw}")
+            
             # Store calibrated rho for statistics
             if not (exact_ratio != exact_ratio):  # Check for NaN
                 all_exact_ratios[layer].append(exact_ratio)
