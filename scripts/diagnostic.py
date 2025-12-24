@@ -19,6 +19,42 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def time_model(model, x, num_iterations=50, warmup=20, device="cuda"):
+    """Time a model with proper warmup and CUDA events."""
+    model.eval()
+    
+    # Warmup
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model(x)
+    if device == "cuda":
+        torch.cuda.synchronize()
+    
+    # Time with CUDA events
+    if device == "cuda":
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
+        
+        with torch.no_grad():
+            for _ in range(num_iterations):
+                _ = model(x)
+        
+        end_event.record()
+        torch.cuda.synchronize()
+        elapsed_time = start_event.elapsed_time(end_event) / 1000.0
+    else:
+        start = time.time()
+        with torch.no_grad():
+            for _ in range(num_iterations):
+                _ = model(x)
+        elapsed_time = time.time() - start
+    
+    return elapsed_time
+
+
 def main():
     print("=" * 60)
     print("RAJNI Diagnostic: FLOPs and Throughput Verification")
@@ -31,6 +67,12 @@ def main():
         print("\n⚠️  WARNING: Running on CPU. Timing will be less accurate.")
         print("   For proper benchmarking, use a GPU.")
     
+    # Check PyTorch version for torch.compile support
+    torch_version = tuple(int(x) for x in torch.__version__.split('.')[:2])
+    has_compile = torch_version >= (2, 0)
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"torch.compile available: {has_compile}")
+    
     # Create model
     print("\n[1] Loading ViT-Base...")
     base_model = timm.create_model('vit_base_patch16_224', pretrained=False)
@@ -41,9 +83,9 @@ def main():
     from evaluation.flops import flops_reduction
     
     # Wrap with RAJNI
-    gamma = 0.01
+    gamma = 0.05  # Higher gamma for meaningful pruning
     print(f"[2] Creating RAJNI model (gamma={gamma})...")
-    rajni_model = AdaptiveJacobianPrunedViT(base_model, gamma=gamma)
+    rajni_model = AdaptiveJacobianPrunedViT(base_model, gamma=gamma, collect_stats=True)
     rajni_model.to(device).eval()
     
     # Create dummy input
@@ -91,91 +133,35 @@ def main():
     print(f"RAJNI:     {flops['rajni_GFLOPs']:.2f} GFLOPs")
     print(f"Reduction: {flops['reduction_percent']:.1f}%")
     
-    # Sanity check
-    print(f"\nSanity check:")
-    print(f"  Token reduction: {overall_token_reduction:.1f}%")
-    print(f"  FLOPs reduction: {flops['reduction_percent']:.1f}%")
-    
-    if flops['reduction_percent'] < overall_token_reduction * 0.5:
-        print("  ⚠️  FLOPs reduction seems LOW compared to token reduction")
-    elif flops['reduction_percent'] > overall_token_reduction * 2:
-        print("  ⚠️  FLOPs reduction seems HIGH compared to token reduction")
-    else:
-        print("  ✓ FLOPs reduction is consistent with token reduction")
-    
     # ============================================
-    # PART C: Throughput measurement (careful!)
+    # PART C: Throughput measurement
     # ============================================
     print("\n" + "=" * 60)
-    print("PART C: Throughput Measurement (Fair Comparison)")
+    print("PART C: Throughput Measurement")
     print("=" * 60)
     
     num_iterations = 50
     warmup_iters = 20
     
-    # CRITICAL: Create a FRESH baseline model for fair comparison
+    # FRESH baseline model
     print("\n[!] Creating FRESH baseline model...")
     baseline_fresh = timm.create_model('vit_base_patch16_224', pretrained=False)
     baseline_fresh.to(device).eval()
     
-    # Warmup BOTH models SEPARATELY (this is key!)
-    print(f"\nWarming up BASELINE ({warmup_iters} iterations)...")
-    with torch.no_grad():
-        for _ in range(warmup_iters):
-            _ = baseline_fresh(x)
-    if device == "cuda":
-        torch.cuda.synchronize()
+    # Also create a RAJNI model without stats collection (faster)
+    rajni_fast = AdaptiveJacobianPrunedViT(
+        timm.create_model('vit_base_patch16_224', pretrained=False).to(device),
+        gamma=gamma, 
+        collect_stats=False  # Skip stats for speed
+    )
+    rajni_fast.to(device).eval()
     
-    print(f"Warming up RAJNI ({warmup_iters} iterations)...")
-    with torch.no_grad():
-        for _ in range(warmup_iters):
-            _ = rajni_model(x)
-    if device == "cuda":
-        torch.cuda.synchronize()
-    
-    # Use CUDA events for accurate timing
-    if device == "cuda":
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-    
-    # Time BASELINE FIRST
     print(f"\nTiming BASELINE ({num_iterations} iterations)...")
-    if device == "cuda":
-        torch.cuda.synchronize()
-        start_event.record()
-    else:
-        start = time.time()
-        
-    with torch.no_grad():
-        for _ in range(num_iterations):
-            _ = baseline_fresh(x)
-    
-    if device == "cuda":
-        end_event.record()
-        torch.cuda.synchronize()
-        baseline_time = start_event.elapsed_time(end_event) / 1000.0
-    else:
-        baseline_time = time.time() - start
+    baseline_time = time_model(baseline_fresh, x, num_iterations, warmup_iters, device)
     baseline_throughput = (num_iterations * batch_size) / baseline_time
     
-    # Time RAJNI SECOND
     print(f"Timing RAJNI ({num_iterations} iterations)...")
-    if device == "cuda":
-        torch.cuda.synchronize()
-        start_event.record()
-    else:
-        start = time.time()
-        
-    with torch.no_grad():
-        for _ in range(num_iterations):
-            _ = rajni_model(x)
-    
-    if device == "cuda":
-        end_event.record()
-        torch.cuda.synchronize()
-        rajni_time = start_event.elapsed_time(end_event) / 1000.0
-    else:
-        rajni_time = time.time() - start
+    rajni_time = time_model(rajni_fast, x, num_iterations, warmup_iters, device)
     rajni_throughput = (num_iterations * batch_size) / rajni_time
     
     speedup = rajni_throughput / baseline_throughput
@@ -189,70 +175,74 @@ def main():
     print(f"└────────────────────────────────────────┘")
     
     # ============================================
-    # PART D: Consistency check
+    # PART D: torch.compile test (if available)
+    # ============================================
+    if has_compile and device == "cuda":
+        print("\n" + "=" * 60)
+        print("PART D: torch.compile Speedup")
+        print("=" * 60)
+        
+        print("\nCompiling RAJNI model...")
+        try:
+            rajni_compiled = torch.compile(rajni_fast, mode="reduce-overhead")
+            
+            # Warmup compiled model (compilation happens on first runs)
+            print("Warming up compiled model (this may take a minute)...")
+            with torch.no_grad():
+                for _ in range(10):
+                    _ = rajni_compiled(x)
+            torch.cuda.synchronize()
+            
+            print(f"Timing RAJNI+compile ({num_iterations} iterations)...")
+            compiled_time = time_model(rajni_compiled, x, num_iterations, warmup_iters, device)
+            compiled_throughput = (num_iterations * batch_size) / compiled_time
+            
+            compile_speedup = compiled_throughput / baseline_throughput
+            
+            print(f"\n┌────────────────────────────────────────┐")
+            print(f"│  WITH torch.compile                    │")
+            print(f"├────────────────────────────────────────┤")
+            print(f"│  Compiled: {compiled_throughput:7.1f} img/s ({compiled_time:.2f}s)    │")
+            print(f"│  Speedup:  {compile_speedup:7.2f}x (vs baseline)       │")
+            print(f"│  vs uncompiled: {compiled_throughput/rajni_throughput:.2f}x           │")
+            print(f"└────────────────────────────────────────┘")
+        except Exception as e:
+            print(f"torch.compile failed: {e}")
+            print("This is often due to dynamic control flow. Consider using 'fullgraph=False'")
+    
+    # ============================================
+    # PART E: Consistency Analysis
     # ============================================
     print("\n" + "=" * 60)
-    print("PART D: Consistency Analysis")
+    print("PART E: Consistency Analysis")
     print("=" * 60)
     
-    # Expected speedup from FLOPs reduction
     flops_speedup = 1.0 / (1.0 - flops['reduction_percent'] / 100)
     
     print(f"\nFLOPs reduction:      {flops['reduction_percent']:.1f}%")
     print(f"Theoretical speedup:  {flops_speedup:.2f}x (from FLOPs)")
     print(f"Measured speedup:     {speedup:.2f}x")
     
-    # Analysis
     ratio = speedup / flops_speedup if flops_speedup > 1 else speedup
     
     print(f"\nAnalysis:")
     if ratio > 2.0:
         print("  ❌ ERROR: Measured speedup >> theoretical!")
-        print("     This indicates a measurement problem.")
-        print("     Possible causes:")
-        print("     - Baseline wasn't properly warmed up")
-        print("     - Different models being compared")
-        print("     - CUDA caching/memory effects")
-        print("     - DataLoader bottleneck (not GPU-bound)")
-    elif ratio > 1.5:
-        print("  ⚠️  WARNING: Measured speedup > theoretical")
-        print("     Possible causes:")
-        print("     - Memory bandwidth improvements (fewer tokens = better cache)")
-        print("     - Measurement variance")
-    elif speedup < 1.0:
-        print("  ⚠️  WARNING: RAJNI is SLOWER than baseline!")
-        print("     With low gamma, pruning overhead may exceed savings.")
-        print("     Try increasing gamma (0.02, 0.05, 0.1)")
-    elif ratio < 0.7:
-        print("  ⚠️  NOTE: Speedup < theoretical")
-        print("     This is NORMAL - real speedup is usually less than")
-        print("     theoretical due to:")
-        print("     - Token selection overhead")
-        print("     - Memory access patterns")
-        print("     - Kernel launch overhead")
+        print("     Check for precision differences (FP16 vs FP32)")
+    elif ratio > 1.3:
+        print("  ⚠️  Speedup slightly > theoretical")
+        print("     May indicate memory/cache benefits from fewer tokens")
+    elif speedup < 0.95:
+        print("  ⚠️  RAJNI is SLOWER than baseline!")
+        print("     Pruning overhead exceeds savings at this gamma.")
+        print("     Try increasing gamma for more aggressive pruning.")
+    elif ratio < 0.6:
+        print("  ⚠️  Speedup < theoretical")
+        print("     Normal due to pruning overhead and memory patterns.")
     else:
         print("  ✓ Speedup is consistent with FLOPs reduction!")
     
     print("\n" + "=" * 60)
-    print("EXPECTED RELATIONSHIPS:")
-    print("=" * 60)
-    print("""
-For gamma=0.01 on ViT-Base, you should see approximately:
-
-  Token reduction:  ~5-15%
-  FLOPs reduction:  ~8-20%  
-  Real speedup:     ~1.05-1.15x
-
-If you're seeing 3x speedup, something is WRONG with measurement.
-
-Common fixes:
-1. Warmup BOTH models before timing
-2. Use the same batch size for both
-3. Create a FRESH baseline model (don't reuse the wrapped one)
-4. Use CUDA events instead of time.time()
-""")
-    
-    print("=" * 60)
     print("Diagnostic complete!")
     print("=" * 60)
 

@@ -40,7 +40,7 @@ def compute_cls_sensitivity(
     V_cls_norm = V_cls.norm(dim=-1)   # [B]
     
     # Sensitivity: how "anchored" is the CLS token
-    rho = (A_cls_cls * V_cls_norm).mean()
+    rho = (1.0 + A_cls_cls * V_cls_norm).mean()
     
     return rho
 
@@ -105,7 +105,7 @@ def compute_keep_ratio(
     prev_mass: torch.Tensor,
     gamma: float,
     eps: float = 1e-6,
-) -> float:
+) -> torch.Tensor:
     """
     Compute adaptive keep ratio based on layer dynamics.
     
@@ -123,17 +123,19 @@ def compute_keep_ratio(
         eps: Small constant for numerical stability
     
     Returns:
-        keep_ratio: Fraction of tokens to keep (0.25 to 4.0)
+        keep_ratio: Fraction of tokens to keep (tensor, 0.25 to 4.0)
     """
     # Relative change in importance mass
     eta = current_mass / (prev_mass + eps)
     
     # Adaptive keep ratio with clamping for stability
-    ratio_raw = (rho ).clamp(0.25, 4.0) ** (-gamma)
+    # Returns a tensor to avoid GPU-CPU sync
+    ratio_raw = (rho * eta).clamp(0.25, 4.0) ** (-gamma)
     
-    return float(ratio_raw)
+    return ratio_raw
 
 
+@torch.no_grad()
 def select_tokens(
     importance: torch.Tensor,
     num_keep: int,
@@ -145,6 +147,8 @@ def select_tokens(
     Returns indices that include the CLS token (always kept)
     plus the top-k most important patch tokens.
     
+    Optimized for GPU: all operations stay on device, minimal allocations.
+    
     Args:
         importance: Per-patch importance [B, num_patches]
         num_keep: Number of patch tokens to keep
@@ -155,19 +159,23 @@ def select_tokens(
                       (CLS at position 0, then sorted patch indices)
     """
     # Average importance across batch for selection
-    scores = importance.mean(dim=0)
+    # Use sum instead of mean to avoid division (faster)
+    scores = importance.sum(dim=0)
     
-    # Select top-k patch indices
-    _, top_indices = torch.topk(scores, k=num_keep)
+    # Select top-k patch indices (already on GPU)
+    _, top_indices = torch.topk(scores, k=num_keep, sorted=False)
     
-    # Sort for consistent ordering (helps with caching)
+    # Sort for consistent ordering (helps with memory coalescing)
     sorted_indices = top_indices.sort().values
     
     # Shift by 1 to account for CLS token at position 0
-    patch_indices = sorted_indices + 1
+    # In-place add to avoid allocation
+    patch_indices = sorted_indices.add_(1)
     
-    # Prepend CLS token index
-    cls_index = torch.zeros(1, device=device, dtype=torch.long)
-    keep_indices = torch.cat([cls_index, patch_indices])
+    # Prepend CLS token index using cat (optimized for small tensors)
+    keep_indices = torch.cat([
+        torch.zeros(1, device=device, dtype=torch.long),
+        patch_indices
+    ])
     
     return keep_indices
