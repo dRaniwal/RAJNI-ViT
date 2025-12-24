@@ -14,12 +14,30 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 
+def _unwrap_model(m):
+    """
+    Unwrap model from DataParallel and/or torch.compile wrappers.
+    
+    Handles any combination in any order:
+    - compile(DataParallel(model))
+    - DataParallel(compile(model))  
+    - compile(model)
+    - DataParallel(model)
+    - model (no wrapper)
+    """
+    while True:
+        if hasattr(m, '_orig_mod'):
+            m = m._orig_mod
+        elif isinstance(m, torch.nn.DataParallel):
+            m = m.module
+        else:
+            break
+    return m
+
+
 def _warmup_model(model: nn.Module, dataloader: DataLoader, device: str, num_batches: int = 10):
     """
     Warmup model to ensure CUDA kernels are compiled and cached.
-    
-    This is critical for fair benchmarking - the first few forward passes
-    are always slower due to JIT compilation and memory allocation.
     """
     model.eval()
     data_iter = iter(dataloader)
@@ -35,7 +53,6 @@ def _warmup_model(model: nn.Module, dataloader: DataLoader, device: str, num_bat
             images = images.to(device, non_blocking=True)
             _ = model(images)
     
-    # Ensure all warmup operations complete
     if device == "cuda":
         torch.cuda.synchronize()
 
@@ -52,11 +69,8 @@ def benchmark(
     """
     Benchmark a RAJNI-wrapped model for accuracy and throughput.
     
-    Measures top-1 accuracy and images per second, while collecting
-    pruning statistics from the model.
-    
     Args:
-        model: RAJNI-wrapped Vision Transformer
+        model: RAJNI-wrapped Vision Transformer (can be wrapped in DataParallel/compile)
         dataloader: Validation data loader
         device: Target device ("cuda" or "cpu")
         warmup: Number of warmup batches (not timed)
@@ -68,28 +82,14 @@ def benchmark(
         throughput: Images per second
         stats: Pruning statistics from last batch
     """
-    # Helper to unwrap model from DataParallel and torch.compile (any order)
-    def _unwrap_model(m):
-        """Get the underlying AdaptiveJacobianPrunedViT from wrapped model."""
-        # Keep unwrapping until we get to the actual model
-        # Handles: compile(DP(model)), DP(compile(model)), or just model
-        while True:
-            if hasattr(m, '_orig_mod'):
-                # Unwrap torch.compile (OptimizedModule)
-                m = m._orig_mod
-            elif isinstance(m, torch.nn.DataParallel):
-                # Unwrap DataParallel
-                m = m.module
-            else:
-                # No more wrappers
-                break
-        return m
+    # Get the underlying model for stats access
+    base_model = _unwrap_model(model)
     
-    # Handle DataParallel wrapper (check after potential compile wrapper)
-    unwrapped_for_device = model
-    if hasattr(unwrapped_for_device, '_orig_mod'):
-        unwrapped_for_device = unwrapped_for_device._orig_mod
-    if not isinstance(unwrapped_for_device, torch.nn.DataParallel):
+    # Handle device placement
+    unwrapped_check = model
+    if hasattr(unwrapped_check, '_orig_mod'):
+        unwrapped_check = unwrapped_check._orig_mod
+    if not isinstance(unwrapped_check, torch.nn.DataParallel):
         model.to(device)
     model.eval()
     
@@ -117,18 +117,18 @@ def benchmark(
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         
-        # Timing with CUDA events (more accurate than time.time)
+        # Timing with CUDA events
         if use_cuda_events and device == "cuda":
             start_event.record()
         else:
-            torch.cuda.synchronize() if device == "cuda" else None
+            if device == "cuda":
+                torch.cuda.synchronize()
             start = time.time()
         
         logits = model(images)
         
-        # Retrieve stats (handles DataParallel + torch.compile)
-        unwrapped = _unwrap_model(model)
-        last_stats = unwrapped.get_last_stats()
+        # Retrieve stats from base model (unwrapped once at start)
+        last_stats = base_model.get_last_stats()
         
         # End timing
         if use_cuda_events and device == "cuda":
@@ -137,7 +137,8 @@ def benchmark(
             elapsed_ms = start_event.elapsed_time(end_event)
             total_time += elapsed_ms / 1000.0
         else:
-            torch.cuda.synchronize() if device == "cuda" else None
+            if device == "cuda":
+                torch.cuda.synchronize()
             total_time += time.time() - start
         
         total_images += images.size(0)
@@ -146,7 +147,6 @@ def benchmark(
         correct += (predictions == labels).sum().item()
         total += labels.size(0)
         
-        # Update progress bar
         if total > 0:
             pbar.set_postfix(acc=f"{100 * correct / total:.2f}%")
     
