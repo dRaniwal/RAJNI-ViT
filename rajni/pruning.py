@@ -129,7 +129,7 @@ def compute_keep_ratio(
     eta = current_mass / (prev_mass + eps)
     
     # Adaptive keep ratio with clamping for stability
-    ratio_raw = (rho * eta).clamp(0.25, 4.0) ** (-gamma)
+    ratio_raw = (rho ).clamp(0.25, 4.0) ** (-gamma)
     
     return float(ratio_raw)
 
