@@ -51,8 +51,9 @@ def calibrate_rho(rho_raw: torch.Tensor, layer_idx: int) -> torch.Tensor:
 
 def compute_cls_sensitivity(
     attention: torch.Tensor,
-    layer_idx: int,
     values: torch.Tensor,
+    *,
+    layer_idx: int = 0,
 ) -> torch.Tensor:
     """
     Compute CLS token sensitivity (rho) from attention and values.
