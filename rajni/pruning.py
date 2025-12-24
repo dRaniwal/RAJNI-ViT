@@ -40,7 +40,7 @@ def compute_cls_sensitivity(
     V_cls_norm = V_cls.norm(dim=-1)   # [B]
     
     # Sensitivity: how "anchored" is the CLS token
-    rho = (1.0 + A_cls_cls * V_cls_norm).mean()
+    rho = (A_cls_cls * V_cls_norm).mean()
     
     return rho
 
