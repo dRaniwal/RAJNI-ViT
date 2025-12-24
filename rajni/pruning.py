@@ -194,13 +194,12 @@ def compute_importance_and_sensitivity(
     V_cls_norm = V_cls_centered.norm(dim=-1)  # [B]
     
     # Raw rho
-    rho_raw = (1.0 + A_cls_cls * V_cls_norm).mean()
+    rho_raw = (1.0 + A_cls_cls * V_cls_norm)
     
     # Apply calibration if enabled
-    if calibrate:
-        rho = calibrate_rho(rho_raw, layer_idx)
-    else:
-        rho = rho_raw
+
+    rho = calibrate_rho(rho_raw, layer_idx)
+
     
     # === Jacobian Importance ===
     A_cls_to_patches = A_mean[:, 0, 1:num_patches + 1]  # [B, num_patches]
