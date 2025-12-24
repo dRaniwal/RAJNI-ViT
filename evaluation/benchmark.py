@@ -83,7 +83,7 @@ def benchmark(
         if total > 0:
             pbar.set_postfix(acc=f"{100 * correct / total:.2f}%")
     
-    accuracy = correct / max(total, 1)
+    accuracy = (correct / max(total, 1)) * 100.0
     throughput = total_images / max(total_time, 1e-6)
     
     return accuracy, throughput, last_stats

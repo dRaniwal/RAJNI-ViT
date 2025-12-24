@@ -106,6 +106,10 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         prev_mass: Optional[torch.Tensor] = None
         
         for blk in self.blocks:
+            # Record token count BEFORE processing this layer
+            # This is the actual number of tokens this layer computes on
+            token_counts.append(x.size(1))
+            
             with autocast(device_type="cuda"):
                 x_norm = blk.norm1(x)
                 attn, v, attn_out = self._extract_attention_values(
@@ -113,8 +117,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 )
                 x = x + blk.drop_path1(attn_out)
                 x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
-            
-            token_counts.append(N + 1)
             
             if N <= self.min_tokens:
                 continue
