@@ -201,13 +201,16 @@ def compute_importance_and_sensitivity(
     A_cls_to_patches = A_mean[:, 0, 1:num_patches + 1]  # [B, num_patches]
     V_patches = V_mean_heads[:, 1:num_patches + 1]  # [B, num_patches, D]
     
-    # Center and normalize value vectors
+        # Center and normalize value vectors
     V_patch_mean = V_patches.mean(dim=1, keepdim=True)
     V_centered = V_patches - V_patch_mean
-    V_norm = V_centered.norm(dim=-1)  # [B, num_patches]
-    
-    # Importance = attention * value norm (derivation-faithful)
-    importance = A_cls_to_patches * V_norm
+    V_norm = V_centered.norm(dim=-1)
+
+    median = V_norm.median(dim=1, keepdim=True).values
+    mad = (V_norm - median).abs().mean(dim=1, keepdim=True)
+
+    V_gate = F.relu((V_norm - median) / (mad + eps))
+    importance = A_cls_to_patches * V_gate
     mass = importance.sum(dim=1).mean()
     
     return importance, mass, rho
