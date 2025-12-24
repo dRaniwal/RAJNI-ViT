@@ -5,12 +5,11 @@ This module provides the main model wrapper that applies inference-time
 token pruning to any timm-compatible Vision Transformer.
 
 Performance notes:
-- Uses native attention with patched forward to capture weights (no redundant computation)
 - All operations stay on GPU to avoid CPU-GPU sync
 - Indices are collected only at the end for visualization
 - Compatible with torch.compile for additional speedup
 """
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Tuple
 import torch
 import torch.nn as nn
 import logging
@@ -39,58 +38,6 @@ from .pruning import (
 )
 
 
-def _make_attn_forward_with_capture(
-    attn_module: nn.Module,
-    storage: Dict[str, Optional[torch.Tensor]],
-) -> Callable:
-    """
-    Create a patched attention forward that captures attention weights and values.
-    
-    This replaces timm's Attention.forward to store intermediate tensors
-    needed for importance scoring, while maintaining identical computation.
-    
-    Args:
-        attn_module: The timm Attention module to patch
-        storage: Dict to store {'attn': tensor, 'v': tensor}
-    
-    Returns:
-        New forward function with capture capability
-    """
-    num_heads = attn_module.num_heads
-    scale = attn_module.scale
-    
-    def forward_with_capture(x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        B, N, C = x.shape
-        head_dim = C // num_heads
-        
-        # QKV projection (same as timm)
-        qkv = attn_module.qkv(x).reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        
-        # Attention computation (same as timm)
-        attn = (q @ k.transpose(-2, -1)) * scale
-        
-        # Apply attention mask if provided
-        if attn_mask is not None:
-            attn = attn + attn_mask
-        
-        attn = attn.softmax(dim=-1)
-        attn = attn_module.attn_drop(attn)
-        
-        # Store for RAJNI importance scoring
-        storage['attn'] = attn
-        storage['v'] = v
-        
-        # Output projection (same as timm)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = attn_module.proj(x)
-        x = attn_module.proj_drop(x)
-        
-        return x
-    
-    return forward_with_capture
-
-
 class AdaptiveJacobianPrunedViT(nn.Module):
     """
     Wrapper for Vision Transformers with adaptive Jacobian-based pruning.
@@ -104,9 +51,9 @@ class AdaptiveJacobianPrunedViT(nn.Module):
     
     Key features:
     - Inference-only (no training required)
-    - Native attention capture (no redundant computation)
     - DataParallel-safe (returns only tensors from forward)
     - Framework-agnostic (works with any timm ViT)
+    - Memory efficient (no tensor storage between layers)
     
     Args:
         model: A timm Vision Transformer model
@@ -144,45 +91,62 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         self.scale = model.blocks[0].attn.scale
         
         self._last_stats: Optional[Dict[str, Any]] = None
-        
-        # Storage for captured attention weights and values (per-layer)
-        # Each block gets its own storage dict
-        self._attn_storage: List[Dict[str, Optional[torch.Tensor]]] = [
-            {'attn': None, 'v': None} for _ in range(self.num_blocks)
-        ]
-        
-        # Patch attention modules to capture weights during forward
-        self._patch_attention_modules()
-
-    def _patch_attention_modules(self) -> None:
-        """
-        Patch each block's attention module to capture attention weights.
-        
-        This replaces the forward method with one that stores attn/v
-        in self._attn_storage during computation.
-        """
-        for i, blk in enumerate(self.base_model.blocks):
-            attn = blk.attn
-            # Store original forward for potential restoration
-            attn._original_forward = attn.forward
-            # Replace with capturing forward
-            attn.forward = _make_attn_forward_with_capture(attn, self._attn_storage[i])
-
-    def restore_attention_modules(self) -> None:
-        """
-        Restore original attention forward methods.
-        
-        Call this if you want to use the base model without RAJNI.
-        """
-        for blk in self.base_model.blocks:
-            attn = blk.attn
-            if hasattr(attn, '_original_forward'):
-                attn.forward = attn._original_forward
-                delattr(attn, '_original_forward')
 
     def get_last_stats(self) -> Optional[Dict[str, Any]]:
         """Get statistics from the last forward pass."""
         return self._last_stats
+
+    def _extract_attention_and_forward(
+        self,
+        x: torch.Tensor,
+        blk: nn.Module,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Process a transformer block and extract attention weights/values.
+        
+        This performs the full block forward pass while capturing the
+        intermediate attention weights and value vectors needed for
+        importance scoring.
+        
+        Args:
+            x: Input tensor [B, N, D]
+            blk: Transformer block module
+            
+        Returns:
+            x_out: Output after block [B, N, D]
+            attn: Attention weights [B, H, N, N]
+            v: Value vectors [B, H, N, head_dim]
+        """
+        B, N, C = x.shape
+        
+        # Attention computation
+        x_norm = blk.norm1(x)
+        qkv = blk.attn.qkv(x_norm)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = blk.attn.attn_drop(attn)
+        
+        # Attention output
+        attn_out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        attn_out = blk.attn.proj(attn_out)
+        attn_out = blk.attn.proj_drop(attn_out)
+        
+        # Apply residual and layer scale if present
+        if hasattr(blk, 'ls1'):
+            x = x + blk.drop_path1(blk.ls1(attn_out))
+        else:
+            x = x + blk.drop_path1(attn_out)
+        
+        # MLP
+        if hasattr(blk, 'ls2'):
+            x = x + blk.drop_path2(blk.ls2(blk.mlp(blk.norm2(x))))
+        else:
+            x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
+        
+        return x, attn, v
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with adaptive token pruning."""
@@ -206,16 +170,8 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             # Record token count
             token_counts[i] = x.size(1)
             
-            # Run native block forward (attention captures attn/v internally)
-            x = blk(x)
-            
-            # Retrieve captured attention weights and values
-            attn = self._attn_storage[i]['attn']
-            v = self._attn_storage[i]['v']
-            
-            # Clear storage immediately to free memory
-            self._attn_storage[i]['attn'] = None
-            self._attn_storage[i]['v'] = None
+            # Forward through block and extract attention
+            x, attn, v = self._extract_attention_and_forward(x, blk)
             
             # Skip pruning if already at minimum
             if N <= self.min_tokens:
