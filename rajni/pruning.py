@@ -151,8 +151,8 @@ def compute_jacobian_importance(
     values: torch.Tensor,
     num_patches: int,
     eps: float = 1e-6,
-    k: int = 5,
-    layer_idx: int = 0,
+    # k: int = 5,
+    # layer_idx: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Jacobian-based importance with LOCAL REDUNDANCY SUPPRESSION.
@@ -206,51 +206,48 @@ def compute_jacobian_importance(
     # 4. Local redundancy (kNN cosine similarity)
     # --------------------------------------------------
 
-    # Normalize patch vectors
-    Vn = F.normalize(V, dim=-1)                  # [B, N, D]
+    # # Normalize patch vectors
+    # Vn = F.normalize(V, dim=-1)                  # [B, N, D]
 
-    # Cosine similarity
-    sim = torch.matmul(Vn, Vn.transpose(-1, -2)) # [B, N, N]
+    # # Cosine similarity
+    # sim = torch.matmul(Vn, Vn.transpose(-1, -2)) # [B, N, N]
 
-    # k nearest neighbors (exclude self)
-    topk_sim, topk_idx = torch.topk(sim, k=k + 1, dim=-1)
-    nbr_sim = topk_sim[:, :, 1:]                 # [B, N, k]
-    nbr_idx = topk_idx[:, :, 1:]                 # [B, N, k]
+    # # k nearest neighbors (exclude self)
+    # topk_sim, topk_idx = torch.topk(sim, k=k + 1, dim=-1)
+    # nbr_sim = topk_sim[:, :, 1:]                 # [B, N, k]
+    # nbr_idx = topk_idx[:, :, 1:]                 # [B, N, k]
 
-    # Jacobian base score
-    jacobian_score = A_cls * V_gate              # [B, N]
+    # # Jacobian base score
+    # jacobian_score = A_cls * V_gate              # [B, N]
 
-    # Gather neighbor scores
-    nbr_score = torch.gather(
-        jacobian_score.unsqueeze(-1).expand(-1, -1, k),
-        dim=1,
-        index=nbr_idx
-    )                                            # [B, N, k]
+    # # Gather neighbor scores
+    # nbr_score = torch.gather(
+    #     jacobian_score.unsqueeze(-1).expand(-1, -1, k),
+    #     dim=1,
+    #     index=nbr_idx
+    # )                                            # [B, N, k]
 
-    # Relative suppression:
-    # if neighbor is stronger AND similar → suppress
-    suppression = nbr_sim * (nbr_score / (jacobian_score.unsqueeze(-1) + eps))
+    # # Relative suppression:
+    # # if neighbor is stronger AND similar → suppress
+    # suppression = nbr_sim * (nbr_score / (jacobian_score.unsqueeze(-1) + eps))
 
-    redundancy_supp = suppression.max(dim=-1).values
-    redundancy_supp = redundancy_supp.clamp(0.0, 1.0)
+    # redundancy_supp = suppression.max(dim=-1).values
+    # redundancy_supp = redundancy_supp.clamp(0.0, 1.0)
 
-    # --------------------------------------------------
-    # 5. Final importance
-    # --------------------------------------------------
-    # --------------------------------------------------
-    # 5. Layer-adaptive fusion: redundancy → importance
-    # --------------------------------------------------
-    num_layers = 12  # ViT-Base (pass if you want later)
-    alpha = layer_idx / max(num_layers - 1, 1)
-    # alpha = alpha.clamp(0.0, 1.0)
+    # # --------------------------------------------------
+    # # 5. Final importance
+    # # --------------------------------------------------
+    # # --------------------------------------------------
+    # # 5. Layer-adaptive fusion: redundancy → importance
+    # # --------------------------------------------------
+    # num_layers = 12  # ViT-Base (pass if you want later)
+    # alpha = layer_idx / max(num_layers - 1, 1)
+    # # alpha = alpha.clamp(0.0, 1.0)
 
-    redundancy_score = (1.0 - redundancy_supp)        # uniqueness
+    # redundancy_score = (1.0 - redundancy_supp)        # uniqueness
 
     jacobian_score = A_cls * V_gate              # semantic importance
-    importance = (
-        alpha * jacobian_score +
-        (1.0 - alpha) * redundancy_score * jacobian_score
-    )
+    importance = jacobian_score
     mass = importance.sum(dim=1).mean()
 
     return importance, mass
@@ -286,15 +283,15 @@ def compute_keep_ratio(
     # Relative change in importance mass
     eta = current_mass / (prev_mass + eps)
     
-    base_keep = torch.exp(-(rho - 0.6)*eta * gamma)
-    base_keep = torch.clamp(base_keep, max=1.0)
-    # --- Linear layer factor ---
-    layer_frac = layer_idx / max(num_layers - 1, 1)
-    layer_factor = min_factor + (1.0 - min_factor) * layer_frac
-    layer_factor = layer_factor**0.5
-
+    # base_keep = torch.exp(-(rho - 0.6)*eta * gamma)
+    # base_keep = torch.clamp(base_keep, max=1.0)
+    # # --- Linear layer factor ---
+    # layer_frac = layer_idx / max(num_layers - 1, 1)
+    # layer_factor = min_factor + (1.0 - min_factor) * layer_frac
+    # layer_factor = layer_factor**0.5
+    base_keep = (rho*eta).clamp(0.25, 4.0)**(-gamma)
     # --- Final keep ratio ---
-    keep_ratio = base_keep * layer_factor
+    keep_ratio = base_keep
     keep_ratio = torch.clamp(keep_ratio, max=1.0)
 
     return keep_ratio

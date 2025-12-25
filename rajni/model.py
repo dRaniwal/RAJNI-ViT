@@ -72,16 +72,12 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         min_tokens: int = 16,
         eps: float = 1e-6,
         collect_stats: bool = True,
-        min_factor: float = 0.8,
-        k: int = 5,
     ) -> None:
         super().__init__()
         
         # Register the base model as a submodule using add_module
         # This ensures proper replication with DataParallel
         self.add_module('base_model', model)
-        self.k = k
-        self.min_factor = min_factor
         self.gamma = gamma
         self.min_tokens = min_tokens
         self.eps = eps
@@ -111,13 +107,6 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         
         q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        #CLS attn:
-        # q_cls = q[:, :, :1]          # [B, H, 1, D]
-        # k_patch = k[:, :, 1:]        # [B, H, N, D]
-
-        # A_cls = (q_cls @ k_patch.transpose(-2, -1)) * attn.scale
-        # A_cls = A_cls.squeeze(2).mean(1)   # [B, N] 
                
         scale = attn_module.scale
         attn = (q @ k.transpose(-2, -1)) * scale
@@ -169,13 +158,13 @@ class AdaptiveJacobianPrunedViT(nn.Module):
 
                 # Compute importance scores (all on GPU)
                 rho = compute_cls_sensitivity(attn, v, layer_idx=i)
-                importance, mass = compute_jacobian_importance(attn, v, N, self.eps,k=self.k, layer_idx=i)
-
+                importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
+                # importance, mass = compute_jacobian_importance(attn, v, N, self.eps,k=self.k, layer_idx=i) --- IGNORE ---
                 
                 
                 
                 # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
-                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps, layer_idx=i, num_layers=12, min_factor=self.min_factor)
+                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
                 N_next = max(self.min_tokens, int(N * keep_ratio.item()))
 
                 if keep_ratio >= 0.999:
