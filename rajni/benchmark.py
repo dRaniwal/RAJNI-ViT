@@ -34,10 +34,10 @@ def benchmark(model, dataloader, device="cuda", warmup=5, max_batches=None):
         logits = model(x)
 
         # Get stats from the model (DataParallel-safe)
-        if isinstance(model, torch.nn.DataParallel):
-            last_stats = model.module.get_last_stats()
-        else:
-            last_stats = model.get_last_stats()
+        # if isinstance(model, torch.nn.DataParallel):
+        #     last_stats = model.module.get_last_stats()
+        # else:
+        # last_stats = model.get_last_stats()
 
         if i >= warmup:
             torch.cuda.synchronize()
@@ -51,4 +51,4 @@ def benchmark(model, dataloader, device="cuda", warmup=5, max_batches=None):
     acc = correct / max(total, 1)
     speed = total_images / max(total_time, 1e-6)
 
-    return acc, speed, last_stats
+    return acc, speed
