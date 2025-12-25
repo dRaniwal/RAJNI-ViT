@@ -139,7 +139,7 @@ def compute_jacobian_importance(
     ) 
     # Jacobian importance: attention * ReLU(standardized value norm)
     # ReLU ensures we only keep positively salient tokens
-    importance = A_cls_to_patches * F.relu(V_standardized)(1-cos_sim)
+    importance = A_cls_to_patches * F.relu(V_standardized)*(1-cos_sim)
     
     # Total mass for adaptive budget computation
     mass = importance.sum(dim=1).mean()
