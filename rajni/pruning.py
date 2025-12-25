@@ -273,7 +273,7 @@ def compute_keep_ratio(
     # --- Linear layer factor ---
     layer_frac = layer_idx / max(num_layers - 1, 1)
     layer_factor = min_factor + (1.0 - min_factor) * layer_frac
-    layer_factor = layer_factor.pow(0.5)
+    layer_factor = layer_factor**0.5
 
     # --- Final keep ratio ---
     keep_ratio = base_keep * layer_factor
