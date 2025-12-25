@@ -94,20 +94,8 @@ def compute_jacobian_importance(
     eps: float = 1e-6,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Jacobian-based importance with:
-    1) semantic centering of value vectors
-    2) spatial (positional) debiasing of value norms
-
-    Importance_i = A(CLS → i) × debiased_saliency(V_i)
-
-    Args:
-        attention: [B, H, N, N] attention after softmax
-        values:    [B, H, N, D] value vectors
-        num_patches: number of patch tokens (excluding CLS)
-
-    Returns:
-        importance: [B, num_patches]
-        mass: scalar importance mass
+    Jacobian-based importance WITHOUT grid assumptions.
+    Safe after pruning.
     """
 
     # --------------------------------------------------
@@ -117,7 +105,7 @@ def compute_jacobian_importance(
     A_cls = A_mean[:, 0, 1:num_patches + 1]         # [B, N]
 
     # --------------------------------------------------
-    # 2. Patch value vectors (semantic signal)
+    # 2. Patch value vectors
     # --------------------------------------------------
     V = values.mean(dim=1)[:, 1:num_patches + 1]    # [B, N, D]
 
@@ -130,31 +118,23 @@ def compute_jacobian_importance(
     V_norm = V.norm(dim=-1)                         # [B, N]
 
     # --------------------------------------------------
-    # 4. Positional debiasing (CRITICAL FIX)
+    # 4. Positional debiasing (token-wise, NOT grid)
     # --------------------------------------------------
-    B, N = V_norm.shape
-    H = W = int(math.sqrt(N))
-    assert H * W == N, "Patch count must form square grid"
-
-    V_grid = V_norm.view(B, H, W)                   # [B, H, W]
-
-    # remove absolute spatial bias
-    V_grid = V_grid - V_grid.mean(dim=(1, 2), keepdim=True)
-
-    V_debiased = V_grid.view(B, N)                  # [B, N]
+    # Remove global positional energy, works for any token subset
+    V_norm = V_norm - V_norm.mean(dim=1, keepdim=True)
 
     # --------------------------------------------------
-    # 5. Saliency gate (centered + debiased)
+    # 5. Saliency gate
     # --------------------------------------------------
-    mu = V_debiased.mean(dim=1, keepdim=True)
-    std = V_debiased.std(dim=1, keepdim=True)
+    mu = V_norm.mean(dim=1, keepdim=True)
+    std = V_norm.std(dim=1, keepdim=True)
 
-    V_gate = F.relu((V_debiased - mu) / (std + eps))
+    V_gate = F.relu((V_norm - mu) / (std + eps))
 
     # --------------------------------------------------
     # 6. Final Jacobian importance
     # --------------------------------------------------
-    importance = A_cls * V_gate                     # [B, N]
+    importance = A_cls * V_gate
     mass = importance.sum(dim=1).mean()
 
     return importance, mass
