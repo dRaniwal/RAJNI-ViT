@@ -117,7 +117,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         q_cls = q[:, :, :1]          # [B, H, 1, D]
         k_patch = k[:, :, 1:]        # [B, H, N, D]
 
-        A_cls = (q_cls @ k_patch.transpose(-2, -1)) * attn.scale
+        A_cls = (q_cls @ k_patch.transpose(-2, -1)) * scale
         A_cls = A_cls.squeeze(2).mean(1)   # [B, N] 
         
         out = (attn @ v).transpose(1, 2).reshape(batch_size, num_tokens, -1)
