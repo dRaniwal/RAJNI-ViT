@@ -130,10 +130,16 @@ def compute_jacobian_importance(
     mu = V_norm.mean(dim=1, keepdim=True)
     std = V_norm.std(dim=1, keepdim=True)
     V_standardized = (V_norm - mu) / (std + eps)
-    
+
+    V_cls = values.mean(dim=1)[:, 0]
+    cos_sim = F.cosine_similarity(
+        V_patches, 
+        V_cls.unsqueeze(1), 
+        dim=-1
+    ) 
     # Jacobian importance: attention * ReLU(standardized value norm)
     # ReLU ensures we only keep positively salient tokens
-    importance = A_cls_to_patches * F.relu(V_standardized)
+    importance = A_cls_to_patches * F.relu(V_standardized)(1-cos_sim)
     
     # Total mass for adaptive budget computation
     mass = importance.sum(dim=1).mean()
