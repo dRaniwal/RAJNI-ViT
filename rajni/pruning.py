@@ -87,66 +87,145 @@ def compute_cls_sensitivity(
     return rho.mean()
 
 
+# def compute_jacobian_importance(
+#     attention: torch.Tensor,
+#     values: torch.Tensor,
+#     num_patches: int,
+#     eps: float = 1e-6,
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+#     """
+#     Compute Jacobian-based importance scores for patch tokens.
+    
+#     We approximate the Jacobian of CLS w.r.t. patches as:
+#         J_i ≈ A[cls→i] * ||V_i - mean(V)||
+    
+#     This captures both attention flow (which patches CLS attends to)
+#     and value saliency (which patches have distinctive features).
+    
+#     Args:
+#         attention: Attention weights [B, H, N, N] after softmax
+#         values: Value vectors [B, H, N, D]
+#         num_patches: Number of patch tokens (excluding CLS)
+#         eps: Small constant for numerical stability
+    
+#     Returns:
+#         importance: Per-patch importance scores [B, num_patches]
+#         mass: Total importance mass (scalar, for adaptive budgeting)
+#     """
+#     # Average attention across heads
+#     A_mean = attention.mean(dim=1)  # [B, N, N]
+    
+#     # CLS-to-patch attention (exclude CLS token at position 0)
+#     A_cls_to_patches = A_mean[:, 0, 1:num_patches + 1]  # [B, num_patches]
+    
+#     # Patch value vectors (averaged across heads)
+#     V_patches = values.mean(dim=1)[:, 1:num_patches + 1]  # [B, num_patches, D]
+    
+#     # Center the value vectors (critical for meaningful norms)
+#     V_mean = V_patches.mean(dim=1, keepdim=True)
+#     V_centered = V_patches - V_mean
+#     V_norm = V_centered.norm(dim=-1)  # [B, num_patches]
+    
+#     # Standardize within each sample
+#     mu = V_norm.mean(dim=1, keepdim=True)
+#     std = V_norm.std(dim=1, keepdim=True)
+#     V_standardized = (V_norm - mu) / (std + eps)
+
+#     V_cls = values.mean(dim=1)[:, 0]
+#     cos_sim = F.cosine_similarity(
+#         V_patches, 
+#         V_cls.unsqueeze(1), 
+#         dim=-1
+#     ) 
+#     # Jacobian importance: attention * ReLU(standardized value norm)
+#     # ReLU ensures we only keep positively salient tokens
+#     importance = A_cls_to_patches * F.relu(V_standardized)*(1-cos_sim)
+    
+#     # Total mass for adaptive budget computation
+#     mass = importance.sum(dim=1).mean()
+    
+#     return importance, mass
+
 def compute_jacobian_importance(
     attention: torch.Tensor,
     values: torch.Tensor,
     num_patches: int,
     eps: float = 1e-6,
+    k: int = 5,
+    layer_idx: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute Jacobian-based importance scores for patch tokens.
-    
-    We approximate the Jacobian of CLS w.r.t. patches as:
-        J_i ≈ A[cls→i] * ||V_i - mean(V)||
-    
-    This captures both attention flow (which patches CLS attends to)
-    and value saliency (which patches have distinctive features).
-    
+    Jacobian-based importance with LOCAL REDUNDANCY SUPPRESSION.
+
+    Importance_i =
+        A(CLS → i)
+        × saliency(V_i)
+        × (1 − redundancy_kNN(V_i))
+
+    Redundancy is measured using cosine similarity with k nearest
+    neighboring patch tokens in value space, after removing
+    positional bias via centering.
+
     Args:
-        attention: Attention weights [B, H, N, N] after softmax
-        values: Value vectors [B, H, N, D]
-        num_patches: Number of patch tokens (excluding CLS)
-        eps: Small constant for numerical stability
-    
+        attention: [B, H, N, N]
+        values:    [B, H, N, D]
+        num_patches: number of patch tokens (excluding CLS)
+        k: number of nearest neighbors for redundancy
+        layer_idx: used to disable redundancy in early layers
+
     Returns:
-        importance: Per-patch importance scores [B, num_patches]
-        mass: Total importance mass (scalar, for adaptive budgeting)
+        importance: [B, num_patches]
+        mass: scalar
     """
-    # Average attention across heads
-    A_mean = attention.mean(dim=1)  # [B, N, N]
-    
-    # CLS-to-patch attention (exclude CLS token at position 0)
-    A_cls_to_patches = A_mean[:, 0, 1:num_patches + 1]  # [B, num_patches]
-    
-    # Patch value vectors (averaged across heads)
-    V_patches = values.mean(dim=1)[:, 1:num_patches + 1]  # [B, num_patches, D]
-    
-    # Center the value vectors (critical for meaningful norms)
-    V_mean = V_patches.mean(dim=1, keepdim=True)
-    V_centered = V_patches - V_mean
-    V_norm = V_centered.norm(dim=-1)  # [B, num_patches]
-    
-    # Standardize within each sample
+
+    # --------------------------------------------------
+    # 1. CLS → patch attention
+    # --------------------------------------------------
+    A_mean = attention.mean(dim=1)                      # [B, N, N]
+    A_cls = A_mean[:, 0, 1:num_patches + 1]             # [B, N]
+
+    # --------------------------------------------------
+    # 2. Patch value vectors (semantic signal)
+    # --------------------------------------------------
+    V = values.mean(dim=1)[:, 1:num_patches + 1]        # [B, N, D]
+
+    # ---- remove positional bias (CRITICAL) ----
+    V = V - V.mean(dim=1, keepdim=True)
+
+    # --------------------------------------------------
+    # 3. Saliency gate (your original logic, untouched)
+    # --------------------------------------------------
+    V_norm = V.norm(dim=-1)                             # [B, N]
+
     mu = V_norm.mean(dim=1, keepdim=True)
     std = V_norm.std(dim=1, keepdim=True)
-    V_standardized = (V_norm - mu) / (std + eps)
 
-    V_cls = values.mean(dim=1)[:, 0]
-    cos_sim = F.cosine_similarity(
-        V_patches, 
-        V_cls.unsqueeze(1), 
-        dim=-1
-    ) 
-    # Jacobian importance: attention * ReLU(standardized value norm)
-    # ReLU ensures we only keep positively salient tokens
-    importance = A_cls_to_patches * F.relu(V_standardized)*(1-cos_sim)
-    
-    # Total mass for adaptive budget computation
+    V_gate = F.relu((V_norm - mu) / (std + eps))        # [B, N]
+
+    # --------------------------------------------------
+    # 4. Local redundancy (kNN cosine similarity)
+    # --------------------------------------------------
+    if layer_idx < 2:
+        # Early layers: redundancy signal unreliable
+        redundancy = 0.0
+    else:
+        Vn = F.normalize(V, dim=-1)                     # [B, N, D]
+
+        # cosine similarity matrix
+        sim = torch.matmul(Vn, Vn.transpose(-1, -2))    # [B, N, N]
+
+        # top-k neighbors (ignore self at index 0)
+        topk_sim, _ = torch.topk(sim, k=k + 1, dim=-1)
+        redundancy = topk_sim[:, :, 1:].mean(dim=-1)    # [B, N]
+
+    # --------------------------------------------------
+    # 5. Final importance
+    # --------------------------------------------------
+    importance = A_cls * V_gate * (1.0 - redundancy)
+
     mass = importance.sum(dim=1).mean()
-    
+
     return importance, mass
-
-
 def compute_keep_ratio(
     rho: torch.Tensor,
     current_mass: torch.Tensor,

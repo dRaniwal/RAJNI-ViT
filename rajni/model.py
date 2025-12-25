@@ -73,12 +73,14 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         eps: float = 1e-6,
         collect_stats: bool = True,
         min_factor: float = 0.8,
+        k: int = 5,
     ) -> None:
         super().__init__()
         
         # Register the base model as a submodule using add_module
         # This ensures proper replication with DataParallel
         self.add_module('base_model', model)
+        self.k = k
         self.min_factor = min_factor
         self.gamma = gamma
         self.min_tokens = min_tokens
@@ -167,7 +169,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
 
                 # Compute importance scores (all on GPU)
                 rho = compute_cls_sensitivity(attn, v, layer_idx=i)
-                importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
+                importance, mass = compute_jacobian_importance(attn, v, N, self.eps,k=self.k, layer_idx=i)
 
                 
                 
