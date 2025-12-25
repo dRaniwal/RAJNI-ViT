@@ -233,8 +233,8 @@ def compute_jacobian_importance(
     redundancy_score = (1.0 - redundancy)        # uniqueness
 
     importance = (
-        alpha * jacobian_score +
-        (1.0 - alpha) * redundancy_score * jacobian_score
+        (alpha * jacobian_score +
+        (1.0 - alpha) * redundancy_score)/(jacobian_score+redundancy_score+eps)
     )
     mass = importance.sum(dim=1).mean()
 
