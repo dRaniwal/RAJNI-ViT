@@ -161,7 +161,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 # Compute importance scores (all on GPU)
                 rho = compute_cls_sensitivity(attn, v, layer_idx=i)
                 if (i+1) % self.k == 0 or cached_importance is None:
-                    importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
+                    importance = compute_jacobian_importance(attn, v, N, self.eps)
                     cached_importance = importance
                     # cached_mass = mass
                 else:
@@ -178,7 +178,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
 
                 if keep_ratio >= 0.999:
                     x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
-                    prev_mass = mass
+                    # prev_mass = mass
                     continue
                 # Prune tokens if needed
                 if N_next < N:
@@ -193,7 +193,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                     N = N_next
                 
                 x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
-                prev_mass = mass
+                # prev_mass = mass
             
             # Final norm and classification head
             x = m.norm(x)

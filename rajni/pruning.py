@@ -247,14 +247,13 @@ def compute_jacobian_importance(
 
     jacobian_score = A_cls * V_gate              # semantic importance
     importance = jacobian_score
-    mass = importance.sum(dim=1).mean()
+    # mass = importance.sum(dim=1).mean()
 
-    return importance, mass
-
+    return importance
 def compute_keep_ratio(
     rho: torch.Tensor,
-    current_mass: torch.Tensor,
-    prev_mass: torch.Tensor,
+    # current_mass: torch.Tensor,
+    # prev_mass: torch.Tensor,
     gamma: float,
     eps: float = 1e-6,
     # layer_idx: int = 1,
@@ -289,7 +288,7 @@ def compute_keep_ratio(
     # layer_frac = layer_idx / max(num_layers - 1, 1)
     # layer_factor = min_factor + (1.0 - min_factor) * layer_frac
     # layer_factor = layer_factor**0.5
-    base_keep = (rho*eta).clamp(0.25, 4.0)**(-gamma)
+    base_keep = (rho).clamp(0.25, 4.0)**(-gamma)
     # --- Final keep ratio ---
     keep_ratio = base_keep
     keep_ratio = torch.clamp(keep_ratio, max=1.0)
