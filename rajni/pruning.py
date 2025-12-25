@@ -288,7 +288,7 @@ def compute_keep_ratio(
     # layer_frac = layer_idx / max(num_layers - 1, 1)
     # layer_factor = min_factor + (1.0 - min_factor) * layer_frac
     # layer_factor = layer_factor**0.5
-    base_keep = (rho).clamp(0.25, 4.0)**(-gamma)
+    base_keep = (2*rho).clamp(0.25, 4.0)**(-gamma)
     # --- Final keep ratio ---
     keep_ratio = base_keep
     keep_ratio = torch.clamp(keep_ratio, max=1.0)
