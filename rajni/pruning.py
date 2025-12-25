@@ -217,6 +217,7 @@ def compute_jacobian_importance(
         # top-k neighbors (ignore self at index 0)
         topk_sim, _ = torch.topk(sim, k=k + 1, dim=-1)
         redundancy = topk_sim[:, :, 1:].mean(dim=-1)    # [B, N]
+        redundancy = redundancy.clamp(min=0.0, max=1.0)
 
     # --------------------------------------------------
     # 5. Final importance
