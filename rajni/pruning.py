@@ -206,15 +206,33 @@ def compute_jacobian_importance(
     # 4. Local redundancy (kNN cosine similarity)
     # --------------------------------------------------
 
-    Vn = F.normalize(V, dim=-1)                     # [B, N, D]
+    # Normalize patch vectors
+    Vn = F.normalize(V, dim=-1)                  # [B, N, D]
 
-    # cosine similarity matrix
-    sim = torch.matmul(Vn, Vn.transpose(-1, -2))    # [B, N, N]
+    # Cosine similarity
+    sim = torch.matmul(Vn, Vn.transpose(-1, -2)) # [B, N, N]
 
-    # top-k neighbors (ignore self at index 0)
-    topk_sim, _ = torch.topk(sim, k=k + 1, dim=-1)
-    redundancy = topk_sim[:, :, 1:].mean(dim=-1)    # [B, N]
-    redundancy = redundancy.clamp(min=0.0, max=1.0)
+    # k nearest neighbors (exclude self)
+    topk_sim, topk_idx = torch.topk(sim, k=k + 1, dim=-1)
+    nbr_sim = topk_sim[:, :, 1:]                 # [B, N, k]
+    nbr_idx = topk_idx[:, :, 1:]                 # [B, N, k]
+
+    # Jacobian base score
+    jacobian_score = A_cls * V_gate              # [B, N]
+
+    # Gather neighbor scores
+    nbr_score = torch.gather(
+        jacobian_score.unsqueeze(-1).expand(-1, -1, k),
+        dim=1,
+        index=nbr_idx
+    )                                            # [B, N, k]
+
+    # Relative suppression:
+    # if neighbor is stronger AND similar → suppress
+    suppression = nbr_sim * (nbr_score / (jacobian_score.unsqueeze(-1) + eps))
+
+    redundancy_supp = suppression.max(dim=-1).values
+    redundancy_supp = redundancy_supp.clamp(0.0, 1.0)
 
     # --------------------------------------------------
     # 5. Final importance
@@ -223,16 +241,13 @@ def compute_jacobian_importance(
     # 5. Layer-adaptive fusion: redundancy → importance
     # --------------------------------------------------
     num_layers = 12  # ViT-Base (pass if you want later)
-    alpha = layer_idx / max(num_layers - 1, 1)
-    # alpha = alpha.clamp(0.0, 1.0)
+    # alpha = layer_idx / max(num_layers - 1, 1)
+    # # alpha = alpha.clamp(0.0, 1.0)
+
+    redundancy_score = (1.0 - redundancy_supp)        # uniqueness
 
     jacobian_score = A_cls * V_gate              # semantic importance
-    redundancy_score = (1.0 - redundancy)        # uniqueness
-
-    importance = (
-        alpha * jacobian_score +
-        (1.0 - alpha) * redundancy_score * jacobian_score
-    )
+    importance = jacobian_score * (1.0 - redundancy_score)
     mass = importance.sum(dim=1).mean()
 
     return importance, mass
