@@ -199,7 +199,7 @@ def compute_jacobian_importance(
     mu = V_norm.mean(dim=1, keepdim=True)
     std = V_norm.std(dim=1, keepdim=True)
 
-    V_gate = (V_norm - mu) / (std + eps)        # [B, N]
+    V_gate = F.relu((V_norm - mu) / (std + eps))        # [B, N]
 
     # --------------------------------------------------
     # 4. Local redundancy (kNN cosine similarity)
@@ -280,7 +280,7 @@ def compute_keep_ratio(
         keep_ratio: Fraction of tokens to keep (tensor, 0.25 to 4.0)
     """
     # Relative change in importance mass
-    eta = current_mass / (prev_mass + eps)
+    # eta = current_mass / (prev_mass + eps)
     
     # base_keep = torch.exp(-(rho - 0.6)*eta * gamma)
     # base_keep = torch.clamp(base_keep, max=1.0)
