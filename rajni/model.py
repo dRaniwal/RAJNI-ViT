@@ -110,20 +110,20 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
         
         #CLS attn:
+        # q_cls = q[:, :, :1]          # [B, H, 1, D]
+        # k_patch = k[:, :, 1:]        # [B, H, N, D]
+
+        # A_cls = (q_cls @ k_patch.transpose(-2, -1)) * attn.scale
+        # A_cls = A_cls.squeeze(2).mean(1)   # [B, N] 
                
         scale = attn_module.scale
         attn = (q @ k.transpose(-2, -1)) * scale
         attn = attn.softmax(dim=-1)
-        q_cls = q[:, :, :1]          # [B, H, 1, D]
-        k_patch = k[:, :, 1:]        # [B, H, N, D]
-
-        A_cls = (q_cls @ k_patch.transpose(-2, -1)) * scale
-        A_cls = A_cls.squeeze(2).mean(1)   # [B, N] 
         
         out = (attn @ v).transpose(1, 2).reshape(batch_size, num_tokens, -1)
         out = attn_module.proj(out)
         
-        return attn, v, out, A_cls
+        return attn, v, out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -153,7 +153,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 
                 # Process through attention and MLP
                 x_norm = blk.norm1(x)
-                attn, v, attn_out, A_cls = self._extract_attention_values(
+                attn, v, attn_out = self._extract_attention_values(
                     x_norm, blk.attn, B, x.size(1)
                 )
                 x = x + blk.drop_path1(attn_out)
@@ -165,7 +165,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                     continue
                 
                 # Compute importance scores (all on GPU)
-                rho = compute_cls_sensitivity(attn, v, A_cls, layer_idx=i)
+                rho = compute_cls_sensitivity(attn, v, layer_idx=i)
                 importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
                 
                 # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
