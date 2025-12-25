@@ -52,6 +52,7 @@ def calibrate_rho(rho_raw: torch.Tensor, layer_idx: int) -> torch.Tensor:
 def compute_cls_sensitivity(
     attention: torch.Tensor,
     values: torch.Tensor,
+    A_cls: torch.Tensor,
     layer_idx: int = 0,
 ) -> torch.Tensor:
     """
@@ -69,8 +70,8 @@ def compute_cls_sensitivity(
         rho: Scalar sensitivity measure
     """
     # Average across heads
-    A_mean = attention.mean(dim=1)  # [B, N, N]
-    A_cls_cls = A_mean[:, 0, 0]     # [B] - CLS self-attention
+    # A_mean = attention.mean(dim=1)  # [B, N, N]
+    # A_cls_cls = A_mean[:, 0, 0]     # [B] - CLS self-attention
     
     # CLS value vector norm (averaged across heads)
     V_mean_heads = values.mean(dim=1)  # [B, N, D]
@@ -82,7 +83,7 @@ def compute_cls_sensitivity(
     V_cls_norm = V_cls_centered.norm(dim=-1)  # [B]
     
     # Sensitivity: how "anchored" is the CLS token
-    rho = (1.0 + A_cls_cls * V_cls_norm)
+    rho = (1.0 + A_cls * V_cls_norm)
     rho = calibrate_rho(rho, layer_idx)
     return rho.mean()
 
