@@ -167,10 +167,10 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
                 N_next = max(self.min_tokens, int(N * keep_ratio.item()))
 
-                if keep_ratio >= 0.999:
-                    x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
-                    prev_mass = mass
-                    continue
+                # if keep_ratio >= 0.999:
+                #     x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
+                #     prev_mass = mass
+                #     continue
                 # Prune tokens if needed
                 if N_next < N:
                     keep_idx = select_tokens(importance, N_next, x.device)
