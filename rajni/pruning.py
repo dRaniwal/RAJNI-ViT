@@ -87,21 +87,100 @@ def compute_cls_sensitivity(
     return rho.mean()
 
 
+# def compute_jacobian_importance(
+#     attention: torch.Tensor,
+#     values: torch.Tensor,
+#     num_patches: int,
+#     eps: float = 1e-6,
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+#     """
+#     Jacobian-based importance WITHOUT grid assumptions.
+#     Safe after pruning.
+#     """
+
+#     # --------------------------------------------------
+#     # 1. CLS → patch attention
+#     # --------------------------------------------------
+#     # CLS → patch attention
+#     A_mean = attention.mean(dim=1)                  # [B, N, N]
+#     A_cls  = A_mean[:, 0, 1:num_patches + 1]         # [B, N]
+
+#     # ---- ATTENTION DEBIASING (NEW) ----
+#     # Remove global spatial preference of CLS
+#     A_cls = A_cls - A_cls.mean(dim=1, keepdim=True)
+
+#     # Optional: rescale to keep numerical stability
+#     A_cls = A_cls / (A_cls.std(dim=1, keepdim=True) + eps)     # [B, N]
+
+#     # --------------------------------------------------
+#     # 2. Patch value vectors
+#     # --------------------------------------------------
+#     V = values.mean(dim=1)[:, 1:num_patches + 1]    # [B, N, D]
+
+#     # ---- semantic centering (removes global bias) ----
+#     V = V - V.mean(dim=1, keepdim=True)             # [B, N, D]
+
+#     # --------------------------------------------------
+#     # 3. Value norm
+#     # --------------------------------------------------
+#     V_norm = V.norm(dim=-1)                         # [B, N]
+
+#     # --------------------------------------------------
+#     # 4. Positional debiasing (token-wise, NOT grid)
+#     # --------------------------------------------------
+#     # Remove global positional energy, works for any token subset
+#     V_norm = V_norm - V_norm.mean(dim=1, keepdim=True)
+
+#     # --------------------------------------------------
+#     # 5. Saliency gate
+#     # --------------------------------------------------
+#     mu = V_norm.mean(dim=1, keepdim=True)
+#     std = V_norm.std(dim=1, keepdim=True)
+
+#     V_gate = (V_norm - mu) / (std + eps)
+
+#     # --------------------------------------------------
+#     # 6. Final Jacobian importance
+#     # --------------------------------------------------
+#     importance = A_cls * V_gate
+#     mass = importance.sum(dim=1).mean()
+
+#     return importance, mass
 def compute_jacobian_importance(
     attention: torch.Tensor,
     values: torch.Tensor,
     num_patches: int,
     eps: float = 1e-6,
+    # k: int = 5,
+    # layer_idx: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Jacobian-based importance WITHOUT grid assumptions.
-    Safe after pruning.
+    Jacobian-based importance with LOCAL REDUNDANCY SUPPRESSION.
+
+    Importance_i =
+        A(CLS → i)
+        × saliency(V_i)
+        × (1 − redundancy_kNN(V_i))
+
+    Redundancy is measured using cosine similarity with k nearest
+    neighboring patch tokens in value space, after removing
+    positional bias via centering.
+
+    Args:
+        attention: [B, H, N, N]
+        values:    [B, H, N, D]
+        num_patches: number of patch tokens (excluding CLS)
+        k: number of nearest neighbors for redundancy
+        layer_idx: used to disable redundancy in early layers
+
+    Returns:
+        importance: [B, num_patches]
+        mass: scalar
     """
 
     # --------------------------------------------------
     # 1. CLS → patch attention
     # --------------------------------------------------
-    # CLS → patch attention
     A_mean = attention.mean(dim=1)                  # [B, N, N]
     A_cls  = A_mean[:, 0, 1:num_patches + 1]         # [B, N]
 
@@ -113,144 +192,72 @@ def compute_jacobian_importance(
     A_cls = A_cls / (A_cls.std(dim=1, keepdim=True) + eps)     # [B, N]
 
     # --------------------------------------------------
-    # 2. Patch value vectors
+    # 2. Patch value vectors (semantic signal)
     # --------------------------------------------------
-    V = values.mean(dim=1)[:, 1:num_patches + 1]    # [B, N, D]
+    V = values.mean(dim=1)[:, 1:num_patches + 1]        # [B, N, D]
 
-    # ---- semantic centering (removes global bias) ----
-    V = V - V.mean(dim=1, keepdim=True)             # [B, N, D]
-
-    # --------------------------------------------------
-    # 3. Value norm
-    # --------------------------------------------------
-    V_norm = V.norm(dim=-1)                         # [B, N]
+    # ---- remove positional bias (CRITICAL) ----
+    V = V - V.mean(dim=1, keepdim=True)
 
     # --------------------------------------------------
-    # 4. Positional debiasing (token-wise, NOT grid)
+    # 3. Saliency gate (your original logic, untouched)
     # --------------------------------------------------
-    # Remove global positional energy, works for any token subset
-    V_norm = V_norm - V_norm.mean(dim=1, keepdim=True)
+    V_norm = V.norm(dim=-1)                             # [B, N]
 
-    # --------------------------------------------------
-    # 5. Saliency gate
-    # --------------------------------------------------
     mu = V_norm.mean(dim=1, keepdim=True)
     std = V_norm.std(dim=1, keepdim=True)
 
-    V_gate = (V_norm - mu) / (std + eps)
+    V_gate = F.relu((V_norm - mu) / (std + eps))        # [B, N]
 
     # --------------------------------------------------
-    # 6. Final Jacobian importance
+    # 4. Local redundancy (kNN cosine similarity)
     # --------------------------------------------------
-    importance = A_cls * V_gate
+
+    # # Normalize patch vectors
+    # Vn = F.normalize(V, dim=-1)                  # [B, N, D]
+
+    # # Cosine similarity
+    # sim = torch.matmul(Vn, Vn.transpose(-1, -2)) # [B, N, N]
+
+    # # k nearest neighbors (exclude self)
+    # topk_sim, topk_idx = torch.topk(sim, k=k + 1, dim=-1)
+    # nbr_sim = topk_sim[:, :, 1:]                 # [B, N, k]
+    # nbr_idx = topk_idx[:, :, 1:]                 # [B, N, k]
+
+    # # Jacobian base score
+    # jacobian_score = A_cls * V_gate              # [B, N]
+
+    # # Gather neighbor scores
+    # nbr_score = torch.gather(
+    #     jacobian_score.unsqueeze(-1).expand(-1, -1, k),
+    #     dim=1,
+    #     index=nbr_idx
+    # )                                            # [B, N, k]
+
+    # # Relative suppression:
+    # # if neighbor is stronger AND similar → suppress
+    # suppression = nbr_sim * (nbr_score / (jacobian_score.unsqueeze(-1) + eps))
+
+    # redundancy_supp = suppression.max(dim=-1).values
+    # redundancy_supp = redundancy_supp.clamp(0.0, 1.0)
+
+    # # --------------------------------------------------
+    # # 5. Final importance
+    # # --------------------------------------------------
+    # # --------------------------------------------------
+    # # 5. Layer-adaptive fusion: redundancy → importance
+    # # --------------------------------------------------
+    # num_layers = 12  # ViT-Base (pass if you want later)
+    # alpha = layer_idx / max(num_layers - 1, 1)
+    # # alpha = alpha.clamp(0.0, 1.0)
+
+    # redundancy_score = (1.0 - redundancy_supp)        # uniqueness
+
+    jacobian_score = A_cls * V_gate              # semantic importance
+    importance = jacobian_score
     mass = importance.sum(dim=1).mean()
 
     return importance, mass
-# def compute_jacobian_importance(
-#     attention: torch.Tensor,
-#     values: torch.Tensor,
-#     num_patches: int,
-#     eps: float = 1e-6,
-#     # k: int = 5,
-#     # layer_idx: int = 0,
-# ) -> Tuple[torch.Tensor, torch.Tensor]:
-#     """
-#     Jacobian-based importance with LOCAL REDUNDANCY SUPPRESSION.
-
-#     Importance_i =
-#         A(CLS → i)
-#         × saliency(V_i)
-#         × (1 − redundancy_kNN(V_i))
-
-#     Redundancy is measured using cosine similarity with k nearest
-#     neighboring patch tokens in value space, after removing
-#     positional bias via centering.
-
-#     Args:
-#         attention: [B, H, N, N]
-#         values:    [B, H, N, D]
-#         num_patches: number of patch tokens (excluding CLS)
-#         k: number of nearest neighbors for redundancy
-#         layer_idx: used to disable redundancy in early layers
-
-#     Returns:
-#         importance: [B, num_patches]
-#         mass: scalar
-#     """
-
-#     # --------------------------------------------------
-#     # 1. CLS → patch attention
-#     # --------------------------------------------------
-#     A_mean = attention.mean(dim=1)                      # [B, N, N]
-#     A_cls = A_mean[:, 0, 1:num_patches + 1]             # [B, N]
-
-#     # --------------------------------------------------
-#     # 2. Patch value vectors (semantic signal)
-#     # --------------------------------------------------
-#     V = values.mean(dim=1)[:, 1:num_patches + 1]        # [B, N, D]
-
-#     # ---- remove positional bias (CRITICAL) ----
-#     V = V - V.mean(dim=1, keepdim=True)
-
-#     # --------------------------------------------------
-#     # 3. Saliency gate (your original logic, untouched)
-#     # --------------------------------------------------
-#     V_norm = V.norm(dim=-1)                             # [B, N]
-
-#     mu = V_norm.mean(dim=1, keepdim=True)
-#     std = V_norm.std(dim=1, keepdim=True)
-
-#     V_gate = F.relu((V_norm - mu) / (std + eps))        # [B, N]
-
-#     # --------------------------------------------------
-#     # 4. Local redundancy (kNN cosine similarity)
-#     # --------------------------------------------------
-
-#     # # Normalize patch vectors
-#     # Vn = F.normalize(V, dim=-1)                  # [B, N, D]
-
-#     # # Cosine similarity
-#     # sim = torch.matmul(Vn, Vn.transpose(-1, -2)) # [B, N, N]
-
-#     # # k nearest neighbors (exclude self)
-#     # topk_sim, topk_idx = torch.topk(sim, k=k + 1, dim=-1)
-#     # nbr_sim = topk_sim[:, :, 1:]                 # [B, N, k]
-#     # nbr_idx = topk_idx[:, :, 1:]                 # [B, N, k]
-
-#     # # Jacobian base score
-#     # jacobian_score = A_cls * V_gate              # [B, N]
-
-#     # # Gather neighbor scores
-#     # nbr_score = torch.gather(
-#     #     jacobian_score.unsqueeze(-1).expand(-1, -1, k),
-#     #     dim=1,
-#     #     index=nbr_idx
-#     # )                                            # [B, N, k]
-
-#     # # Relative suppression:
-#     # # if neighbor is stronger AND similar → suppress
-#     # suppression = nbr_sim * (nbr_score / (jacobian_score.unsqueeze(-1) + eps))
-
-#     # redundancy_supp = suppression.max(dim=-1).values
-#     # redundancy_supp = redundancy_supp.clamp(0.0, 1.0)
-
-#     # # --------------------------------------------------
-#     # # 5. Final importance
-#     # # --------------------------------------------------
-#     # # --------------------------------------------------
-#     # # 5. Layer-adaptive fusion: redundancy → importance
-#     # # --------------------------------------------------
-#     # num_layers = 12  # ViT-Base (pass if you want later)
-#     # alpha = layer_idx / max(num_layers - 1, 1)
-#     # # alpha = alpha.clamp(0.0, 1.0)
-
-#     # redundancy_score = (1.0 - redundancy_supp)        # uniqueness
-
-#     jacobian_score = A_cls * V_gate              # semantic importance
-#     importance = jacobian_score
-#     mass = importance.sum(dim=1).mean()
-
-#     return importance, mass
 
 def compute_keep_ratio(
     rho: torch.Tensor,
