@@ -129,7 +129,7 @@ def compute_jacobian_importance(
     mu = V_norm.mean(dim=1, keepdim=True)
     std = V_norm.std(dim=1, keepdim=True)
 
-    V_gate = F.relu((V_norm - mu) / (std + eps))
+    V_gate = (V_norm - mu) / (std + eps)
 
     # --------------------------------------------------
     # 6. Final Jacobian importance
