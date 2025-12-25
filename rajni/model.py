@@ -72,13 +72,14 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         min_tokens: int = 16,
         eps: float = 1e-6,
         collect_stats: bool = True,
+        min_factor: float = 0.8,
     ) -> None:
         super().__init__()
         
         # Register the base model as a submodule using add_module
         # This ensures proper replication with DataParallel
         self.add_module('base_model', model)
-        
+        self.min_factor = min_factor
         self.gamma = gamma
         self.min_tokens = min_tokens
         self.eps = eps
@@ -172,7 +173,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 
                 
                 # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
-                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
+                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps, layer_idx=i, num_layers=len(self.blocks), min_factor=self.min_factor)
                 N_next = max(self.min_tokens, int(N * keep_ratio.item()))
 
                 if keep_ratio >= 0.999:

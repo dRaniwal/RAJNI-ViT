@@ -52,7 +52,7 @@ def calibrate_rho(rho_raw: torch.Tensor, layer_idx: int) -> torch.Tensor:
 def compute_cls_sensitivity(
     attention: torch.Tensor,
     values: torch.Tensor,   
-    layer_idx: int = 0,
+    layer_idx: int = 0
 ) -> torch.Tensor:
     """
     Compute CLS token sensitivity (rho) from attention and values.
@@ -147,6 +147,9 @@ def compute_keep_ratio(
     prev_mass: torch.Tensor,
     gamma: float,
     eps: float = 1e-6,
+    layer_idx: int = 1,
+    num_layers: int = 12,
+    min_factor: float = 0.8,
 ) -> torch.Tensor:
     """
     Compute adaptive keep ratio based on layer dynamics.
@@ -170,12 +173,17 @@ def compute_keep_ratio(
     # Relative change in importance mass
     eta = current_mass / (prev_mass + eps)
     
-    # Adaptive keep ratio with clamping for stability
-    # Returns a tensor to avoid GPU-CPU sync
-    keep_ratio = torch.exp((-(rho - 0.6) * gamma))
-    keep_ratio = torch.clamp(keep_ratio, max=1.0)
-    return keep_ratio
+    base_keep = torch.exp(-(rho - 0.6) * gamma)
+    base_keep = torch.clamp(base_keep, max=1.0)
+    # --- Linear layer factor ---
+    layer_frac = layer_idx / max(num_layers - 1, 1)
+    layer_factor = min_factor + (1.0 - min_factor) * layer_frac
 
+    # --- Final keep ratio ---
+    keep_ratio = base_keep * layer_factor
+    keep_ratio = torch.clamp(keep_ratio, max=1.0)
+
+    return keep_ratio
 
 @torch.no_grad()
 def select_tokens(
