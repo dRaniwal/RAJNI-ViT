@@ -188,21 +188,13 @@ def compute_jacobian_importance(
     # Remove global spatial preference of CLS
     A_cls = A_cls - A_cls.mean(dim=1, keepdim=True)
 
-    # Optional: rescale to keep numerical stability
-    A_cls = A_cls / (A_cls.std(dim=1, keepdim=True) + eps)     # [B, N]
-
     # --------------------------------------------------
     # 2. Patch value vectors (semantic signal)
     # --------------------------------------------------
     V = values.mean(dim=1)[:, 1:num_patches + 1]        # [B, N, D]
 
     # ---- remove positional bias (CRITICAL) ----
-    V = V - V.mean(dim=1, keepdim=True)
-
-    # --------------------------------------------------
-    # 3. Saliency gate (your original logic, untouched)
-    # --------------------------------------------------
-    V_norm = V.norm(dim=-1)                             # [B, N]
+    V_norm = (V - V.mean(dim=1, keepdim=True)).norm(dim=-1)                           # [B, N]
 
     mu = V_norm.mean(dim=1, keepdim=True)
     std = V_norm.std(dim=1, keepdim=True)
