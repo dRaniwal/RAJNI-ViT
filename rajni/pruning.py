@@ -172,7 +172,7 @@ def compute_keep_ratio(
     
     # Adaptive keep ratio with clamping for stability
     # Returns a tensor to avoid GPU-CPU sync
-    keep_ratio = math.exp(-(rho - 0.6) * gamma)
+    keep_ratio = torch.exp(-(rho - 0.6) * gamma)
     keep_ratio = torch.clamp(keep_ratio, max=1.0)
     return keep_ratio
 
