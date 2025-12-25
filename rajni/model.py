@@ -173,7 +173,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 
                 
                 # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
-                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps, layer_idx=i, num_layers=len(self.blocks), min_factor=self.min_factor)
+                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps, layer_idx=i, num_layers=len(blk), min_factor=self.min_factor)
                 N_next = max(self.min_tokens, int(N * keep_ratio.item()))
 
                 if keep_ratio >= 0.999:
