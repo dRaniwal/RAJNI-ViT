@@ -199,7 +199,7 @@ def compute_jacobian_importance(
     mu = V_norm.mean(dim=1, keepdim=True)
     std = V_norm.std(dim=1, keepdim=True)
 
-    V_gate = F.relu((V_norm - mu) / (std + eps))        # [B, N]
+    V_gate = (V_norm - mu) / (std + eps)        # [B, N]
 
     # --------------------------------------------------
     # 4. Local redundancy (kNN cosine similarity)
