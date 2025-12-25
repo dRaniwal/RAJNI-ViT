@@ -119,87 +119,89 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         return attn, v, out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with adaptive token pruning."""
-        B = x.size(0)
-        
-        # Access base model components
-        m = self.base_model
-        
-        # Patch embedding and positional encoding
-        x = m.patch_embed(x)
-        x = m._pos_embed(x)
-        x = m.patch_drop(x)
-        
-        N = x.size(1) - 1
-        
-        # Pre-allocate lists (avoid dynamic allocation overhead)
-        num_blocks = len(m.blocks)
-        token_counts: List[int] = [0] * num_blocks
-        kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * num_blocks
-        
-        prev_mass: Optional[torch.Tensor] = None
-        
-        for i, blk in enumerate(m.blocks):
-            # Record token count (this is just an int, no GPU sync)
-            token_counts[i] = x.size(1)
+        with torch.no_grad():
+
+            """Forward pass with adaptive token pruning."""
+            B = x.size(0)
             
-            # Process through attention and MLP
-            x_norm = blk.norm1(x)
-            attn, v, attn_out = self._extract_attention_values(
-                x_norm, blk.attn, B, x.size(1)
-            )
-            x = x + blk.drop_path1(attn_out)
-            x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
+            # Access base model components
+            m = self.base_model
             
-            # Skip pruning if already at minimum
-            if N <= self.min_tokens:
-                prev_mass = None
-                continue
+            # Patch embedding and positional encoding
+            x = m.patch_embed(x)
+            x = m._pos_embed(x)
+            x = m.patch_drop(x)
             
-            # Compute importance scores (all on GPU)
-            rho = compute_cls_sensitivity(attn, v, layer_idx=i)
-            importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
+            N = x.size(1) - 1
             
-            # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
-            if prev_mass is not None:
-                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
-                # .item() is now traced by torch.compile with capture_scalar_outputs=True
-                N_next = max(self.min_tokens, int(N * keep_ratio.item()))
+            # Pre-allocate lists (avoid dynamic allocation overhead)
+            num_blocks = len(m.blocks)
+            token_counts: List[int] = [0] * num_blocks
+            kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * num_blocks
+            
+            prev_mass: Optional[torch.Tensor] = None
+            
+            for i, blk in enumerate(m.blocks):
+                # Record token count (this is just an int, no GPU sync)
+                token_counts[i] = x.size(1)
+                
+                # Process through attention and MLP
+                x_norm = blk.norm1(x)
+                attn, v, attn_out = self._extract_attention_values(
+                    x_norm, blk.attn, B, x.size(1)
+                )
+                x = x + blk.drop_path1(attn_out)
+                x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
+                
+                # Skip pruning if already at minimum
+                if N <= self.min_tokens:
+                    prev_mass = None
+                    continue
+                
+                # Compute importance scores (all on GPU)
+                rho = compute_cls_sensitivity(attn, v, layer_idx=i)
+                importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
+                
+                # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
+                if prev_mass is not None:
+                    keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
+                    # .item() is now traced by torch.compile with capture_scalar_outputs=True
+                    N_next = max(self.min_tokens, int(N * keep_ratio.item()))
+                else:
+                    N_next = N
+                
+                # Prune tokens if needed
+                if N_next < N:
+                    keep_idx = select_tokens(importance, N_next, x.device)
+                    
+                    # Store on GPU, move to CPU only at the end
+                    if self.collect_stats:
+                        kept_indices_gpu[i] = keep_idx.detach()
+                    
+                    # Index selection (contiguous memory access)
+                    x = torch.index_select(x, dim=1, index=keep_idx)
+                    N = N_next
+                
+                prev_mass = mass
+            
+            # Final norm and classification head
+            x = m.norm(x)
+            logits = m.head(x[:, 0])
+            
+            # Move stats to CPU AFTER forward pass completes (batch all transfers)
+            if self.collect_stats:
+                kept_indices_cpu = [
+                    idx.cpu() if idx is not None else None 
+                    for idx in kept_indices_gpu
+                ]
+                self._last_stats = {
+                    "token_counts": token_counts,
+                    "kept_indices": [idx for idx in kept_indices_cpu if idx is not None],
+                }
             else:
-                N_next = N
+                self._last_stats = {"token_counts": token_counts, "kept_indices": []}
             
-            # Prune tokens if needed
-            if N_next < N:
-                keep_idx = select_tokens(importance, N_next, x.device)
-                
-                # Store on GPU, move to CPU only at the end
-                if self.collect_stats:
-                    kept_indices_gpu[i] = keep_idx.detach()
-                
-                # Index selection (contiguous memory access)
-                x = torch.index_select(x, dim=1, index=keep_idx)
-                N = N_next
-            
-            prev_mass = mass
-        
-        # Final norm and classification head
-        x = m.norm(x)
-        logits = m.head(x[:, 0])
-        
-        # Move stats to CPU AFTER forward pass completes (batch all transfers)
-        if self.collect_stats:
-            kept_indices_cpu = [
-                idx.cpu() if idx is not None else None 
-                for idx in kept_indices_gpu
-            ]
-            self._last_stats = {
-                "token_counts": token_counts,
-                "kept_indices": [idx for idx in kept_indices_cpu if idx is not None],
-            }
-        else:
-            self._last_stats = {"token_counts": token_counts, "kept_indices": []}
-        
-        return logits
+            return logits
 
     def __repr__(self) -> str:
         return (
