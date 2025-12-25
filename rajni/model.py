@@ -72,6 +72,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         min_tokens: int = 16,
         eps: float = 1e-6,
         collect_stats: bool = True,
+        k: int = 2,
     ) -> None:
         super().__init__()
         
@@ -82,7 +83,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         self.min_tokens = min_tokens
         self.eps = eps
         self.collect_stats = collect_stats
-        
+        self.k = k
         self.num_heads = model.blocks[0].attn.num_heads
         self.embed_dim = model.embed_dim
         
@@ -137,7 +138,8 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             num_blocks = len(m.blocks)
             token_counts: List[int] = [0] * num_blocks
             kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * num_blocks
-            
+            cached_importance = None
+            cached_mass = None
             prev_mass = torch.tensor(1.0, device=x.device)            
             for i, blk in enumerate(m.blocks):
                 # Record token count (this is just an int, no GPU sync)
@@ -158,7 +160,14 @@ class AdaptiveJacobianPrunedViT(nn.Module):
 
                 # Compute importance scores (all on GPU)
                 rho = compute_cls_sensitivity(attn, v, layer_idx=i)
-                importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
+                if i % self.k == 0 or cached_importance is None:
+                    importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
+                    cached_importance = importance
+                    cached_mass = mass
+                else:
+                    importance = cached_importance
+                    mass = cached_mass
+                # importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
                 # importance, mass = compute_jacobian_importance(attn, v, N, self.eps,k=self.k, layer_idx=i) --- IGNORE ---
                 
                 
@@ -167,10 +176,10 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
                 N_next = max(self.min_tokens, int(N * keep_ratio.item()))
 
-                # if keep_ratio >= 0.999:
-                #     x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
-                #     prev_mass = mass
-                #     continue
+                if keep_ratio >= 0.999:
+                    x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
+                    prev_mass = mass
+                    continue
                 # Prune tokens if needed
                 if N_next < N:
                     keep_idx = select_tokens(importance, N_next, x.device)
