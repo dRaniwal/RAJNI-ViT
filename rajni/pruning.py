@@ -249,7 +249,7 @@ def compute_jacobian_importance(
     jacobian_score = A_cls * V_gate              # semantic importance
     importance = (
         alpha * jacobian_score +
-        (1.0 - alpha) * redundancy_score
+        (1.0 - alpha) * redundancy_score * jacobian_score
     )
     mass = importance.sum(dim=1).mean()
 
@@ -286,7 +286,7 @@ def compute_keep_ratio(
     # Relative change in importance mass
     eta = current_mass / (prev_mass + eps)
     
-    base_keep = torch.exp(-(rho - 0.6) * gamma)
+    base_keep = torch.exp(-(rho - 0.6)*eta * gamma)
     base_keep = torch.clamp(base_keep, max=1.0)
     # --- Linear layer factor ---
     layer_frac = layer_idx / max(num_layers - 1, 1)
