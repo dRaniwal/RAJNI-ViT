@@ -157,21 +157,23 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                     x_norm, blk.attn, B, x.size(1)
                 )
                 x = x + blk.drop_path1(attn_out)
-                x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
-                
                 # Skip pruning if already at minimum
                 if N <= self.min_tokens:
+                    x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
                     prev_mass = None
                     continue
-                
+
+
                 # Compute importance scores (all on GPU)
                 rho = compute_cls_sensitivity(attn, v, layer_idx=i)
                 importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
+
+                
+                
                 
                 # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
                 keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
                 N_next = max(self.min_tokens, int(N * keep_ratio.item()))
-                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
 
                 if keep_ratio >= 0.999:
                     prev_mass = mass
@@ -188,6 +190,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                     x = torch.index_select(x, dim=1, index=keep_idx)
                     N = N_next
                 
+                x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
                 prev_mass = mass
             
             # Final norm and classification head
