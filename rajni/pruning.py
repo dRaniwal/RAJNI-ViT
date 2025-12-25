@@ -227,7 +227,7 @@ def compute_jacobian_importance(
     # --------------------------------------------------
     num_layers = 12  # ViT-Base (pass if you want later)
     alpha = layer_idx / max(num_layers - 1, 1)
-    alpha = alpha.clamp(0.0, 1.0)
+    # alpha = alpha.clamp(0.0, 1.0)
 
     jacobian_score = A_cls * V_gate              # semantic importance
     redundancy_score = (1.0 - redundancy)        # uniqueness
