@@ -205,19 +205,16 @@ def compute_jacobian_importance(
     # --------------------------------------------------
     # 4. Local redundancy (kNN cosine similarity)
     # --------------------------------------------------
-    if layer_idx < 2:
-        # Early layers: redundancy signal unreliable
-        redundancy = 0.0
-    else:
-        Vn = F.normalize(V, dim=-1)                     # [B, N, D]
 
-        # cosine similarity matrix
-        sim = torch.matmul(Vn, Vn.transpose(-1, -2))    # [B, N, N]
+    Vn = F.normalize(V, dim=-1)                     # [B, N, D]
 
-        # top-k neighbors (ignore self at index 0)
-        topk_sim, _ = torch.topk(sim, k=k + 1, dim=-1)
-        redundancy = topk_sim[:, :, 1:].mean(dim=-1)    # [B, N]
-        redundancy = redundancy.clamp(min=0.0, max=1.0)
+    # cosine similarity matrix
+    sim = torch.matmul(Vn, Vn.transpose(-1, -2))    # [B, N, N]
+
+    # top-k neighbors (ignore self at index 0)
+    topk_sim, _ = torch.topk(sim, k=k + 1, dim=-1)
+    redundancy = topk_sim[:, :, 1:].mean(dim=-1)    # [B, N]
+    redundancy = redundancy.clamp(min=0.0, max=1.0)
 
     # --------------------------------------------------
     # 5. Final importance
