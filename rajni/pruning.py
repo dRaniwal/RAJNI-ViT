@@ -241,13 +241,16 @@ def compute_jacobian_importance(
     # 5. Layer-adaptive fusion: redundancy → importance
     # --------------------------------------------------
     num_layers = 12  # ViT-Base (pass if you want later)
-    # alpha = layer_idx / max(num_layers - 1, 1)
-    # # alpha = alpha.clamp(0.0, 1.0)
+    alpha = layer_idx / max(num_layers - 1, 1)
+    # alpha = alpha.clamp(0.0, 1.0)
 
     redundancy_score = (1.0 - redundancy_supp)        # uniqueness
 
     jacobian_score = A_cls * V_gate              # semantic importance
-    importance = jacobian_score * (1.0 - redundancy_score)
+    importance = (
+        alpha * jacobian_score +
+        (1.0 - alpha) * redundancy_score
+    )
     mass = importance.sum(dim=1).mean()
 
     return importance, mass
