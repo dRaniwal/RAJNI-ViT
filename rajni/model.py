@@ -139,8 +139,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             token_counts: List[int] = [0] * num_blocks
             kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * num_blocks
             
-            prev_mass: Optional[torch.Tensor] = None
-            
+            prev_mass = torch.tensor(1.0, device=x.device)            
             for i, blk in enumerate(m.blocks):
                 # Record token count (this is just an int, no GPU sync)
                 token_counts[i] = x.size(1)
@@ -163,13 +162,13 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                 importance, mass = compute_jacobian_importance(attn, v, N, self.eps)
                 
                 # Adaptive keep ratio (stays on GPU, scalar captured by dynamo)
-                if prev_mass is not None:
-                    keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
-                    # .item() is now traced by torch.compile with capture_scalar_outputs=True
-                    N_next = max(self.min_tokens, int(N * keep_ratio.item()))
-                else:
-                    N_next = N
-                
+                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
+                N_next = max(self.min_tokens, int(N * keep_ratio.item()))
+                keep_ratio = compute_keep_ratio(rho, mass, prev_mass, self.gamma, self.eps)
+
+                if keep_ratio >= 0.999:
+                    prev_mass = mass
+                    continue
                 # Prune tokens if needed
                 if N_next < N:
                     keep_idx = select_tokens(importance, N_next, x.device)
