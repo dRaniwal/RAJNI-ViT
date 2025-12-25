@@ -101,8 +101,16 @@ def compute_jacobian_importance(
     # --------------------------------------------------
     # 1. CLS → patch attention
     # --------------------------------------------------
+    # CLS → patch attention
     A_mean = attention.mean(dim=1)                  # [B, N, N]
-    A_cls = A_mean[:, 0, 1:num_patches + 1]         # [B, N]
+    A_cls  = A_mean[:, 0, 1:num_patches + 1]         # [B, N]
+
+    # ---- ATTENTION DEBIASING (NEW) ----
+    # Remove global spatial preference of CLS
+    A_cls = A_cls - A_cls.mean(dim=1, keepdim=True)
+
+    # Optional: rescale to keep numerical stability
+    A_cls = A_cls / (A_cls.std(dim=1, keepdim=True) + eps)     # [B, N]
 
     # --------------------------------------------------
     # 2. Patch value vectors
