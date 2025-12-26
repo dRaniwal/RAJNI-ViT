@@ -94,58 +94,58 @@ def compute_cls_sensitivity(
 #     eps: float = 1e-6,
 # ) -> Tuple[torch.Tensor, torch.Tensor]:
 #     """
-#     Jacobian-based importance WITHOUT grid assumptions.
-#     Safe after pruning.
+#     Compute Jacobian-based importance scores for patch tokens.
+    
+#     We approximate the Jacobian of CLS w.r.t. patches as:
+#         J_i ≈ A[cls→i] * ||V_i - mean(V)||
+    
+#     This captures both attention flow (which patches CLS attends to)
+#     and value saliency (which patches have distinctive features).
+    
+#     Args:
+#         attention: Attention weights [B, H, N, N] after softmax
+#         values: Value vectors [B, H, N, D]
+#         num_patches: Number of patch tokens (excluding CLS)
+#         eps: Small constant for numerical stability
+    
+#     Returns:
+#         importance: Per-patch importance scores [B, num_patches]
+#         mass: Total importance mass (scalar, for adaptive budgeting)
 #     """
-
-#     # --------------------------------------------------
-#     # 1. CLS → patch attention
-#     # --------------------------------------------------
-#     # CLS → patch attention
-#     A_mean = attention.mean(dim=1)                  # [B, N, N]
-#     A_cls  = A_mean[:, 0, 1:num_patches + 1]         # [B, N]
-
-#     # ---- ATTENTION DEBIASING (NEW) ----
-#     # Remove global spatial preference of CLS
-#     A_cls = A_cls - A_cls.mean(dim=1, keepdim=True)
-
-#     # Optional: rescale to keep numerical stability
-#     A_cls = A_cls / (A_cls.std(dim=1, keepdim=True) + eps)     # [B, N]
-
-#     # --------------------------------------------------
-#     # 2. Patch value vectors
-#     # --------------------------------------------------
-#     V = values.mean(dim=1)[:, 1:num_patches + 1]    # [B, N, D]
-
-#     # ---- semantic centering (removes global bias) ----
-#     V = V - V.mean(dim=1, keepdim=True)             # [B, N, D]
-
-#     # --------------------------------------------------
-#     # 3. Value norm
-#     # --------------------------------------------------
-#     V_norm = V.norm(dim=-1)                         # [B, N]
-
-#     # --------------------------------------------------
-#     # 4. Positional debiasing (token-wise, NOT grid)
-#     # --------------------------------------------------
-#     # Remove global positional energy, works for any token subset
-#     V_norm = V_norm - V_norm.mean(dim=1, keepdim=True)
-
-#     # --------------------------------------------------
-#     # 5. Saliency gate
-#     # --------------------------------------------------
+#     # Average attention across heads
+#     A_mean = attention.mean(dim=1)  # [B, N, N]
+    
+#     # CLS-to-patch attention (exclude CLS token at position 0)
+#     A_cls_to_patches = A_mean[:, 0, 1:num_patches + 1]  # [B, num_patches]
+    
+#     # Patch value vectors (averaged across heads)
+#     V_patches = values.mean(dim=1)[:, 1:num_patches + 1]  # [B, num_patches, D]
+    
+#     # Center the value vectors (critical for meaningful norms)
+#     V_mean = V_patches.mean(dim=1, keepdim=True)
+#     V_centered = V_patches - V_mean
+#     V_norm = V_centered.norm(dim=-1)  # [B, num_patches]
+    
+#     # Standardize within each sample
 #     mu = V_norm.mean(dim=1, keepdim=True)
 #     std = V_norm.std(dim=1, keepdim=True)
+#     V_standardized = (V_norm - mu) / (std + eps)
 
-#     V_gate = (V_norm - mu) / (std + eps)
-
-#     # --------------------------------------------------
-#     # 6. Final Jacobian importance
-#     # --------------------------------------------------
-#     importance = A_cls * V_gate
+#     V_cls = values.mean(dim=1)[:, 0]
+#     cos_sim = F.cosine_similarity(
+#         V_patches, 
+#         V_cls.unsqueeze(1), 
+#         dim=-1
+#     ) 
+#     # Jacobian importance: attention * ReLU(standardized value norm)
+#     # ReLU ensures we only keep positively salient tokens
+#     importance = A_cls_to_patches * F.relu(V_standardized)*(1-cos_sim)
+    
+#     # Total mass for adaptive budget computation
 #     mass = importance.sum(dim=1).mean()
-
+    
 #     return importance, mass
+
 def compute_jacobian_importance(
     attention: torch.Tensor,
     values: torch.Tensor,
@@ -181,20 +181,21 @@ def compute_jacobian_importance(
     # --------------------------------------------------
     # 1. CLS → patch attention
     # --------------------------------------------------
-    A_mean = attention.mean(dim=1)                  # [B, N, N]
-    A_cls  = A_mean[:, 0, 1:num_patches + 1]         # [B, N]
-
-    # ---- ATTENTION DEBIASING (NEW) ----
-    # Remove global spatial preference of CLS
+    A_mean = attention.mean(dim=1)                      # [B, N, N]
+    A_cls = A_mean[:, 0, 1:num_patches + 1]             # [B, N]
     A_cls = A_cls - A_cls.mean(dim=1, keepdim=True)
-
     # --------------------------------------------------
     # 2. Patch value vectors (semantic signal)
     # --------------------------------------------------
     V = values.mean(dim=1)[:, 1:num_patches + 1]        # [B, N, D]
 
     # ---- remove positional bias (CRITICAL) ----
-    V_norm = (V - V.mean(dim=1, keepdim=True)).norm(dim=-1)                           # [B, N]
+    V = V - V.mean(dim=1, keepdim=True)
+
+    # --------------------------------------------------
+    # 3. Saliency gate (your original logic, untouched)
+    # --------------------------------------------------
+    V_norm = V.norm(dim=-1)                             # [B, N]
 
     mu = V_norm.mean(dim=1, keepdim=True)
     std = V_norm.std(dim=1, keepdim=True)
@@ -247,18 +248,18 @@ def compute_jacobian_importance(
 
     jacobian_score = A_cls * V_gate              # semantic importance
     importance = jacobian_score
-    # mass = importance.sum(dim=1).mean()
+    mass = importance.sum(dim=1).mean()
 
-    return importance
+    return importance, mass
 def compute_keep_ratio(
     rho: torch.Tensor,
-    # current_mass: torch.Tensor,
-    # prev_mass: torch.Tensor,
+    current_mass: torch.Tensor,
+    prev_mass: torch.Tensor,
     gamma: float,
     eps: float = 1e-6,
-    # layer_idx: int = 1,
-    # num_layers: int = 12,
-    # min_factor: float = 0.8,
+    layer_idx: int = 1,
+    num_layers: int = 12,
+    min_factor: float = 0.8,
 ) -> torch.Tensor:
     """
     Compute adaptive keep ratio based on layer dynamics.
@@ -280,7 +281,7 @@ def compute_keep_ratio(
         keep_ratio: Fraction of tokens to keep (tensor, 0.25 to 4.0)
     """
     # Relative change in importance mass
-    # eta = current_mass / (prev_mass + eps)
+    eta = current_mass / (prev_mass + eps)
     
     # base_keep = torch.exp(-(rho - 0.6)*eta * gamma)
     # base_keep = torch.clamp(base_keep, max=1.0)
@@ -288,7 +289,7 @@ def compute_keep_ratio(
     # layer_frac = layer_idx / max(num_layers - 1, 1)
     # layer_factor = min_factor + (1.0 - min_factor) * layer_frac
     # layer_factor = layer_factor**0.5
-    base_keep = (2*rho).clamp(0.25, 4.0)**(-gamma)
+    base_keep = (rho*eta).clamp(0.25, 4.0)**(-gamma)
     # --- Final keep ratio ---
     keep_ratio = base_keep
     keep_ratio = torch.clamp(keep_ratio, max=1.0)
