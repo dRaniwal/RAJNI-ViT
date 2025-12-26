@@ -50,27 +50,29 @@ class AdaptiveJacobianPrunedViT(nn.Module):
     # --------------------------------------------------
     def _cheap_cls_attention(self, x, blk):
         """
+        CLS-only attention using timm fused qkv.
         Computes:
-        - Q only for CLS
+        - Q for CLS only
         - K,V for all tokens
-        Complexity: O(N·D)
         """
-        B, N, _ = x.shape
+        B, N, D = x.shape
         attn = blk.attn
+        H = self.num_heads
+        Dh = self.head_dim
 
-        # ---- Linear projections (separated!) ----
-        q = attn.q(x[:, :1])        # [B,1,D]
-        k = attn.k(x)               # [B,N,D]
-        v = attn.v(x)               # [B,N,D]
+        # ---- fused qkv ----
+        qkv = attn.qkv(x)                        # [B, N, 3D]
+        qkv = qkv.reshape(B, N, 3, H, Dh)
+        qkv = qkv.permute(2, 0, 3, 1, 4)         # [3, B, H, N, Dh]
 
-        # reshape to heads
-        q = q.reshape(B, 1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        k = k.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        v = v.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]         # each [B, H, N, Dh]
 
-        # CLS attention
-        attn_cls = (q @ k.transpose(-2, -1)) * attn.scale
-        attn_cls = attn_cls.softmax(dim=-1)  # [B,H,1,N]
+        # ---- CLS-only query ----
+        q_cls = q[:, :, :1]                      # [B, H, 1, Dh]
+
+        # ---- CLS attention ----
+        attn_cls = (q_cls @ k.transpose(-2, -1)) * attn.scale
+        attn_cls = attn_cls.softmax(dim=-1)      # [B, H, 1, N]
 
         return attn_cls, v
 
