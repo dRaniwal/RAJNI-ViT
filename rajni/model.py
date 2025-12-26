@@ -112,11 +112,11 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                     attn_cls, v = self._cls_attention_and_values(x_norm, blk.attn)
 
                     # CLS sensitivity (rho)
-                    rho = compute_cls_sensitivity(
-                        attention=attn_cls,
-                        values=v,
-                        layer_idx=layer_idx,
-                    )
+                    # rho = compute_cls_sensitivity(
+                    #     attention=attn_cls,
+                    #     values=v,
+                    #     layer_idx=layer_idx,
+                    # )
 
                     # Jacobian importance (patch-level)
                     importance, mass = compute_jacobian_importance(
@@ -128,7 +128,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
 
                     # adaptive keep ratio
                     keep_ratio = compute_keep_ratio(
-                        rho=rho,
+                        # rho=rho,
                         current_mass=mass,
                         prev_mass=prev_mass,
                         gamma=self.gamma,

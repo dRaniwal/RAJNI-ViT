@@ -252,14 +252,14 @@ def compute_jacobian_importance(
 
     return importance, mass
 def compute_keep_ratio(
-    rho: torch.Tensor,
+    # rho: torch.Tensor,
     current_mass: torch.Tensor,
     prev_mass: torch.Tensor,
     gamma: float,
     eps: float = 1e-6,
-    layer_idx: int = 1,
-    num_layers: int = 12,
-    min_factor: float = 0.8,
+    # layer_idx: int = 1,
+    # num_layers: int = 12,
+    # min_factor: float = 0.8,
 ) -> torch.Tensor:
     """
     Compute adaptive keep ratio based on layer dynamics.
@@ -289,7 +289,7 @@ def compute_keep_ratio(
     # layer_frac = layer_idx / max(num_layers - 1, 1)
     # layer_factor = min_factor + (1.0 - min_factor) * layer_frac
     # layer_factor = layer_factor**0.5
-    base_keep = (rho*eta).clamp(0.25, 4.0)**(-gamma)
+    base_keep = (eta).clamp(0.25, 4.0)**(-gamma)
     # --- Final keep ratio ---
     keep_ratio = base_keep
     keep_ratio = torch.clamp(keep_ratio, max=1.0)
