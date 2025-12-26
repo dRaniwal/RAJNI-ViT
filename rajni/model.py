@@ -1,12 +1,12 @@
 """
-RAJNI: Adaptive Jacobian-based Token Pruning for Vision Transformers.
-
-Correct execution order:
-CHEAP CLS ATTENTION → PRUNE → FULL ATTENTION
+RAJNI DEBUG VERSION
+Purpose: identify why speedup is not scaling with token pruning
 """
+
 from typing import Dict, List, Optional, Any
 import torch
 import torch.nn as nn
+import time
 import logging
 
 logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
@@ -28,6 +28,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         min_tokens: int = 16,
         eps: float = 1e-6,
         collect_stats: bool = True,
+        debug: bool = True,          # 👈 DEBUG FLAG
     ):
         super().__init__()
         self.base_model = model
@@ -35,6 +36,7 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         self.min_tokens = min_tokens
         self.eps = eps
         self.collect_stats = collect_stats
+        self.debug = debug
 
         self.embed_dim = model.embed_dim
         self.num_heads = model.blocks[0].attn.num_heads
@@ -46,36 +48,27 @@ class AdaptiveJacobianPrunedViT(nn.Module):
         return self._last_stats
 
     # --------------------------------------------------
-    # Cheap CLS-only attention (NO full QKV)
+    # Cheap CLS-only attention (NO full N×N attention)
     # --------------------------------------------------
     def _cheap_cls_attention(self, x, blk):
-        """
-        CLS-only attention using timm fused qkv.
-        Computes:
-        - Q for CLS only
-        - K,V for all tokens
-        """
         B, N, D = x.shape
         attn = blk.attn
         H = self.num_heads
         Dh = self.head_dim
 
-        # ---- fused qkv ----
-        qkv = attn.qkv(x)                        # [B, N, 3D]
-        qkv = qkv.reshape(B, N, 3, H, Dh)
-        qkv = qkv.permute(2, 0, 3, 1, 4)         # [3, B, H, N, Dh]
+        qkv = attn.qkv(x)
+        qkv = qkv.reshape(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q, k, v = qkv[0], qkv[1], qkv[2]         # each [B, H, N, Dh]
-
-        # ---- CLS-only query ----
-        q_cls = q[:, :, :1]                      # [B, H, 1, Dh]
-
-        # ---- CLS attention ----
+        q_cls = q[:, :, :1]                       # [B,H,1,Dh]
         attn_cls = (q_cls @ k.transpose(-2, -1)) * attn.scale
-        attn_cls = attn_cls.softmax(dim=-1)      # [B, H, 1, N]
+        attn_cls = attn_cls.softmax(dim=-1)
 
         return attn_cls, v
 
+    # --------------------------------------------------
+    # Forward
+    # --------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             B = x.size(0)
@@ -91,17 +84,22 @@ class AdaptiveJacobianPrunedViT(nn.Module):
 
             prev_mass = torch.tensor(1.0, device=x.device)
 
+            total_t_cheap = 0.0
+            total_t_full = 0.0
+
             for i, blk in enumerate(m.blocks):
                 token_counts.append(x.size(1))
 
-                # ==================================================
-                # 1️⃣ CHEAP IMPORTANCE (CLS-only)
-                # ==================================================
+                # -----------------------------
+                # CHEAP IMPORTANCE
+                # -----------------------------
                 if N > self.min_tokens:
+                    t0 = time.perf_counter()
+
                     x_norm = blk.norm1(x)
                     attn_cls, v = self._cheap_cls_attention(x_norm, blk)
 
-                    # Fake full attention ONLY logically (no N² compute)
+                    # Fake attention tensor for reuse (logical only)
                     attn_fake = attn_cls.expand(-1, -1, x.size(1), -1)
 
                     rho = compute_cls_sensitivity(attn_fake, v, layer_idx=i)
@@ -121,10 +119,13 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                         N = N_next
 
                     prev_mass = mass
+                    total_t_cheap += time.perf_counter() - t0
 
-                # ==================================================
-                # 2️⃣ FULL ATTENTION (ONLY ON PRUNED TOKENS)
-                # ==================================================
+                # -----------------------------
+                # FULL ATTENTION (EXPENSIVE)
+                # -----------------------------
+                t1 = time.perf_counter()
+
                 x = x + blk.drop_path1(
                     blk.attn(blk.norm1(x))
                 )
@@ -132,13 +133,30 @@ class AdaptiveJacobianPrunedViT(nn.Module):
                     blk.mlp(blk.norm2(x))
                 )
 
+                total_t_full += time.perf_counter() - t1
+
+                if self.debug:
+                    print(
+                        f"[Layer {i:02d}] "
+                        f"tokens entering full attn = {x.size(1)}"
+                    )
+
             # ---- Head ----
             x = m.norm(x)
             logits = m.head(x[:, 0])
 
             if self.collect_stats:
-                self._last_stats = {"token_counts": token_counts}
-            else:
-                self._last_stats = None
+                self._last_stats = {
+                    "token_counts": token_counts,
+                    "t_cheap_sec": total_t_cheap,
+                    "t_full_sec": total_t_full,
+                    "cheap_vs_full_ratio": total_t_cheap / (total_t_full + 1e-9),
+                }
+
+            if self.debug:
+                print("\n=== TIMING SUMMARY ===")
+                print(f"Cheap path time: {total_t_cheap:.4f}s")
+                print(f"Full attn time : {total_t_full:.4f}s")
+                print(f"Cheap / Full   : {total_t_cheap / (total_t_full + 1e-9):.3f}")
 
             return logits
