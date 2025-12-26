@@ -1,158 +1,118 @@
+"""
+RAJNI — Fixed Scheduled Token Pruning (Stable & Fast)
+
+Implements SAINT-style pruning with:
+- fixed r_max, alpha schedule
+- importance-based token selection
+- early pruning BEFORE attention
+"""
+
+from typing import Dict, Any, Optional, List
 import torch
 import torch.nn as nn
-from typing import Dict, Any, Optional, List
 
 from .pruning import (
-    compute_cls_sensitivity,
     compute_jacobian_importance,
-    compute_keep_ratio,
     select_tokens,
 )
 
-
 class AdaptiveJacobianPrunedViT(nn.Module):
     """
-    RAJNI: Adaptive Jacobian-based Token Pruning for Vision Transformers
+    Fixed-schedule token pruning for ViT.
 
-    Core principles (SAINT-consistent):
-    ----------------------------------
-    1. Importance is computed using CLS-only attention (cheap).
-    2. Tokens are pruned BEFORE full attention.
-    3. Full attention is executed only on surviving tokens.
-    4. No fake attention, no manual pos-embed, no kernel-breaking ops.
-
-    This preserves FlashAttention / SDPA paths.
+    N_l = N_0 * (1 - r_max * (l / (L-1))^alpha)
     """
 
     def __init__(
         self,
         model: nn.Module,
-        gamma: float = 0.5,
+        r_max: float = 0.6,
+        alpha: float = 2.0,
         min_tokens: int = 16,
         eps: float = 1e-6,
         collect_stats: bool = True,
     ):
         super().__init__()
+        self.add_module("base_model", model)
 
-        # register base model correctly (DataParallel safe)
-        self.base_model = model
-
-        self.gamma = gamma
+        self.r_max = r_max
+        self.alpha = alpha
         self.min_tokens = min_tokens
         self.eps = eps
         self.collect_stats = collect_stats
 
-        self.embed_dim = model.embed_dim
-        self.num_heads = model.blocks[0].attn.num_heads
-        self.head_dim = self.embed_dim // self.num_heads
-
+        self.num_layers = len(model.blocks)
         self._last_stats: Optional[Dict[str, Any]] = None
 
-    # --------------------------------------------------
-    # Public API for benchmark / visualizer
     # --------------------------------------------------
     def get_last_stats(self):
         return self._last_stats
 
     # --------------------------------------------------
-    # CLS-only attention (CHEAP, no expansion)
-    # --------------------------------------------------
-    def _cls_attention_and_values(self, x_norm, attn_module):
-        """
-        Computes:
-            - CLS → all attention (A_cls)
-            - value vectors (v)
+    def _target_tokens(self, layer_idx: int, N0: int) -> int:
+        """Fixed pruning schedule"""
+        frac = layer_idx / max(self.num_layers - 1, 1)
+        keep_ratio = 1.0 - self.r_max * (frac ** self.alpha)
+        keep_ratio = max(keep_ratio, 0.0)
+        return max(self.min_tokens, int(N0 * keep_ratio))
 
-        Shapes:
-            A_cls: [B, H, 1, N]
-            v:     [B, H, N, D]
-        """
-        B, N, _ = x_norm.shape
-
-        qkv = attn_module.qkv(x_norm)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        q_cls = q[:, :, :1]  # CLS only
-        attn_cls = (q_cls @ k.transpose(-2, -1)) * attn_module.scale
-        attn_cls = attn_cls.softmax(dim=-1)
-
-        return attn_cls, v
-
-    # --------------------------------------------------
-    # Forward
     # --------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             m = self.base_model
             B = x.size(0)
 
-            # ---- Patch + CLS + Pos (SAFE, timm-native) ----
+            # ---- Patch + Pos ----
             x = m.patch_embed(x)
             x = m._pos_embed(x)
             x = m.patch_drop(x)
 
-            N = x.size(1) - 1  # patch tokens only
+            N = x.size(1) - 1  # patches only
+            N0 = N
 
             token_counts: List[int] = []
-            prev_mass = torch.tensor(1.0, device=x.device)
+            kept_indices_gpu: List[Optional[torch.Tensor]] = [None] * self.num_layers
 
             for layer_idx, blk in enumerate(m.blocks):
+
                 token_counts.append(x.size(1))
 
-                # --------------------------------------------------
-                # PRUNE BEFORE FULL ATTENTION
-                # --------------------------------------------------
-                if N > self.min_tokens:
+                # -----------------------------------------
+                # PRUNE BEFORE ATTENTION (scheduled)
+                # -----------------------------------------
+                target_N = self._target_tokens(layer_idx, N0)
+
+                if N > target_N:
+                    # ---- cheap importance calc ----
                     x_norm = blk.norm1(x)
+                    attn = blk.attn
 
-                    # cheap CLS-only signal
-                    attn_cls, v = self._cls_attention_and_values(x_norm, blk.attn)
+                    qkv = attn.qkv(x_norm).reshape(
+                        B, x.size(1), 3, attn.num_heads, -1
+                    ).permute(2, 0, 3, 1, 4)
 
-                    # CLS sensitivity (rho)
-                    # rho = compute_cls_sensitivity(
-                    #     attention=attn_cls,
-                    #     values=v,
-                    #     layer_idx=layer_idx,
-                    # )
+                    q, k, v = qkv[0], qkv[1], qkv[2]
 
-                    # Jacobian importance (patch-level)
-                    importance, mass = compute_jacobian_importance(
-                        attention=attn_cls,
-                        values=v,
-                        num_patches=N,
-                        eps=self.eps,
+                    A = (q @ k.transpose(-2, -1)) * attn.scale
+                    A = A.softmax(dim=-1)
+
+                    importance, _ = compute_jacobian_importance(
+                        A, v, N, eps=self.eps
                     )
 
-                    # adaptive keep ratio
-                    keep_ratio = compute_keep_ratio(
-                        # rho=rho,
-                        current_mass=mass,
-                        prev_mass=prev_mass,
-                        gamma=self.gamma,
-                        eps=self.eps,
+                    keep_idx = select_tokens(
+                        importance, target_N, device=x.device
                     )
 
-                    keep_ratio_scalar = float(keep_ratio.clamp(0.0, 1.0).item())
-                    N_next = max(self.min_tokens, int(N * keep_ratio_scalar))
+                    if self.collect_stats:
+                        kept_indices_gpu[layer_idx] = keep_idx.detach()
 
-                    # actual pruning
-                    if N_next < N:
-                        keep_idx = select_tokens(
-                            importance=importance,
-                            num_keep=N_next,
-                            device=x.device,
-                        )
-                        x = torch.index_select(x, dim=1, index=keep_idx)
-                        N = N_next
+                    x = torch.index_select(x, dim=1, index=keep_idx)
+                    N = target_N
 
-                    prev_mass = mass
-
-                # --------------------------------------------------
-                # FULL BLOCK (FUSED ATTENTION PATH)
-                # --------------------------------------------------
+                # -----------------------------------------
+                # FULL BLOCK FORWARD
+                # -----------------------------------------
                 x = x + blk.drop_path1(blk.attn(blk.norm1(x)))
                 x = x + blk.drop_path2(blk.mlp(blk.norm2(x)))
 
@@ -163,17 +123,18 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             if self.collect_stats:
                 self._last_stats = {
                     "token_counts": token_counts,
+                    "kept_indices": [
+                        idx.cpu() for idx in kept_indices_gpu if idx is not None
+                    ],
                 }
             else:
-                self._last_stats = None
+                self._last_stats = {"token_counts": token_counts}
 
             return logits
 
     def __repr__(self):
         return (
-            f"AdaptiveJacobianPrunedViT("
-            f"gamma={self.gamma}, "
-            f"min_tokens={self.min_tokens}, "
-            f"layers={len(self.base_model.blocks)}, "
-            f"embed_dim={self.embed_dim})"
+            f"RAJNI_FixedSchedule("
+            f"r_max={self.r_max}, alpha={self.alpha}, "
+            f"min_tokens={self.min_tokens})"
         )
