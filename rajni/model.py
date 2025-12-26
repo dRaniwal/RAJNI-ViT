@@ -75,9 +75,21 @@ class AdaptiveJacobianPrunedViT(nn.Module):
             m = self.base_model
 
             # ---- Patch + Pos ----
-            x = m.patch_embed(x)
-            x = m._pos_embed(x)
-            x = m.patch_drop(x)
+            # ---- Patch embedding ----
+            x = m.patch_embed(x)  # [B, N, D]
+            B, N, D = x.shape
+            device = x.device
+
+            # ---- CLS token (FORCE correct device) ----
+            cls_token = m.cls_token.expand(B, -1, -1).to(device)
+            x = torch.cat((cls_token, x), dim=1)  # [B, N+1, D]
+
+            # ---- Positional embedding (slice safely) ----
+            pos_embed = m.pos_embed[:, : x.size(1), :].to(device)
+            x = x + pos_embed
+
+            # ---- Dropout ----
+            x = m.pos_drop(x)
 
             N = x.size(1) - 1
             token_counts: List[int] = []
