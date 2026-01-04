@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from attention import RAJNIAttention
+from .attention import RAJNIAttention
 
 class RAJNIViTWrapper(nn.Module):
     def __init__(self, base_model: nn.Module, pruning_schedule: Dict[int, Dict]):

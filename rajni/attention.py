@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from importance import compute_importance
+from .importance import compute_importance
 
 class RAJNIAttention(nn.Module):
     def __init__(self, attn: nn.Module, keep_ratio: float, update: bool):
