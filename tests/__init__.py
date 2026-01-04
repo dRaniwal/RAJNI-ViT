@@ -1,3 +1,0 @@
-"""
-RAJNI-ViT Test Suite.
-"""
