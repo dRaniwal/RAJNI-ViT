@@ -44,8 +44,24 @@ print(model.get_last_stats())
 
 ## Evaluation
 
+### Using run.py
+
+```bash
+python -m rajni.run \
+  --data_path ../../Downloads/val \  #Path to dataset
+  --model vit_base_patch16_224 \     
+  --batch_size 256 \                 
+  --schedule schedule.json \    #json file location with schedule
+  --compare_base \           #Use if want a comparison with base model
+  --max_batches 100 \
+  --warmup 5 \
+  --device cuda
+```
+
+### Programmatic Evaluation
+
 ```python
-from rajni import evalualte_model
+from rajni import evaluate_model
 # Evaluate on validation set
 acc, throughput = evaluate_model(
     model=model,

@@ -1,0 +1,7 @@
+{
+  "3": { "keep_ratio": 0.95, "update": false },
+  "4": { "keep_ratio": 0.95, "update": true },
+  "5": { "keep_ratio": 0.85, "update": true },
+  "6": { "keep_ratio": 0.85, "update": true },
+  "7": { "keep_ratio": 0.95, "update": true }
+}
