@@ -2,6 +2,8 @@
 
 Rank-Adaptive Jacobian Neuronal Importance for Vision Transformers
 
+**Fully Dynamic Scheduling** — No fixed pruning schedules. Token pruning adapts per-batch based on layer difficulty using q-norm exponential scheduling.
+
 ## Installation
 
 ```bash
@@ -21,16 +23,14 @@ base = timm.create_model(
     pretrained=True,
 )
 
-# Define pruning schedule
-schedule = {
-    3: {"keep_ratio": 0.88, "update": True},
-    4: {"keep_ratio": 0.88, "update": True},
-    7: {"keep_ratio": 0.8, "update": True},
-    8: {"keep_ratio": 0.72, "update": True},
-}
-
-# Wrap with RAJNI
-model = RAJNIViTWrapper(base, schedule)
+# Wrap with RAJNI (fully dynamic scheduling)
+model = RAJNIViTWrapper(
+    base,
+    percentile=0.75,     # q-norm percentile for difficulty
+    kr_min=0.60,         # minimum keep ratio
+    gamma=2.5,           # exponential decay rate
+    skip_layers=(10, 11) # layers to skip pruning
+)
 model.cuda().eval()
 
 # Test inference
@@ -48,11 +48,39 @@ print(model.get_last_stats())
 
 ```bash
 python -m rajni.run \
-  --data_path ../../Downloads/val \  #Path to dataset
-  --model vit_base_patch16_224 \     
-  --batch_size 256 \                 
-  --schedule schedule.json \    #json file location with schedule
-  --compare_base \           #Use if want a comparison with base model
+  --data_path ../../Downloads/val \
+  --model vit_base_patch16_224 \
+  --batch_size 256 \
+  --compare_base \
+  --max_batches 100 \
+  --warmup 5 \
+  --device cuda \
+  --percentile 0.75 \
+  --kr_min 0.60 \
+  --gamma 2.5 \
+  --skip_layers 10 11
+```
+
+Optionally, save dynamic parameters in a JSON file:
+
+```json
+{
+  "percentile": 0.75,
+  "kr_min": 0.60,
+  "gamma": 2.5,
+  "skip_layers": [10, 11]
+}
+```
+
+Then run:
+
+```bash
+python -m rajni.run \
+  --data_path ../../Downloads/val \
+  --model vit_base_patch16_224 \
+  --batch_size 256 \
+  --schedule schedule.json \
+  --compare_base \
   --max_batches 100 \
   --warmup 5 \
   --device cuda
@@ -72,10 +100,18 @@ acc, throughput = evaluate_model(
 )
 ```
 
-## Pruning Schedule
+## Dynamic Scheduling
 
-The pruning schedule is a dictionary where:
-- **Key**: Transformer block index
-- **Value**: Configuration dict with:
-  - `keep_ratio`: Fraction of tokens to keep (e.g., 0.88 = keep 88%)
-  - `update`: Whether to update importance scores dynamically
+RAJNI uses **q-norm exponential scheduling** to compute keep ratios at runtime:
+
+1. **Importance**: `CLS-attention × sigmoid(|V|)` 
+2. **Layer Difficulty**: `D_l = mean(max(q - log(score), 0)) / |q|`
+   - `q = percentile(log_scores, p)`
+3. **Keep Ratio**: `kr = max(kr_min, exp(-gamma × D_l))`
+
+### Parameters
+
+- `percentile`: Quantile for difficulty computation (default: 0.75)
+- `kr_min`: Minimum keep ratio to prevent over-pruning (default: 0.60)
+- `gamma`: Controls sensitivity to difficulty (default: 2.5)
+- `skip_layers`: Layers that bypass pruning entirely (default: [10, 11])

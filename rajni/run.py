@@ -31,7 +31,15 @@ def get_args():
 
     # RAJNI
     parser.add_argument("--schedule", type=str, default=None,
-                        help="Path to JSON file containing RAJNI pruning schedule")
+                        help="Path to JSON file containing RAJNI dynamic parameters (optional)")
+    parser.add_argument("--percentile", type=float, default=0.75,
+                        help="Percentile for q-norm difficulty computation")
+    parser.add_argument("--kr_min", type=float, default=0.60,
+                        help="Minimum keep ratio")
+    parser.add_argument("--gamma", type=float, default=2.5,
+                        help="Exponential decay rate for keep ratio")
+    parser.add_argument("--skip_layers", type=int, nargs="+", default=[10, 11],
+                        help="Layer indices to skip pruning (full attention)")
 
     # Eval
     parser.add_argument("--warmup", type=int, default=5)
@@ -112,22 +120,42 @@ def main():
     # --------------------------------------------------
     # RAJNI model
     # --------------------------------------------------
-    if args.schedule is None:
-        raise ValueError("You must provide --schedule for RAJNI evaluation")
-
-    with open(args.schedule, "r") as f:
-        pruning_schedule = json.load(f)
-
-    print("\nLoaded RAJNI schedule:")
-    for k, v in pruning_schedule.items():
-        print(f"  Layer {k}: {v}")
+    # Load dynamic parameters from schedule file if provided
+    if args.schedule is not None:
+        with open(args.schedule, "r") as f:
+            dynamic_params = json.load(f)
+        
+        percentile = dynamic_params.get("percentile", args.percentile)
+        kr_min = dynamic_params.get("kr_min", args.kr_min)
+        gamma = dynamic_params.get("gamma", args.gamma)
+        skip_layers = tuple(dynamic_params.get("skip_layers", args.skip_layers))
+        
+        print("\nLoaded RAJNI dynamic parameters:")
+        print(f"  percentile: {percentile}")
+        print(f"  kr_min: {kr_min}")
+        print(f"  gamma: {gamma}")
+        print(f"  skip_layers: {skip_layers}")
+    else:
+        percentile = args.percentile
+        kr_min = args.kr_min
+        gamma = args.gamma
+        skip_layers = tuple(args.skip_layers)
+        
+        print("\nUsing default RAJNI dynamic parameters:")
+        print(f"  percentile: {percentile}")
+        print(f"  kr_min: {kr_min}")
+        print(f"  gamma: {gamma}")
+        print(f"  skip_layers: {skip_layers}")
 
     rajni_model = RAJNIViTWrapper(
         base_model=timm.create_model(
             args.model,
             pretrained=True,
         ),
-        pruning_schedule=pruning_schedule,
+        percentile=percentile,
+        kr_min=kr_min,
+        gamma=gamma,
+        skip_layers=skip_layers,
     ).to(device).eval()
 
     print("\n🔹 Evaluating RAJNI model")
