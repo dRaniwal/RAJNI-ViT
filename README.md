@@ -1,6 +1,6 @@
 # RAJNI-ViT
 
-Rank-Adaptive Jacobian Neuronal Importance for Vision Transformers
+**Rank-Adaptive Jacobian Neuronal Importance for Vision Transformers** — dynamic token pruning for accelerated ViT inference with minimal accuracy loss.
 
 ## Installation
 
@@ -8,74 +8,88 @@ Rank-Adaptive Jacobian Neuronal Importance for Vision Transformers
 pip install torch timm
 ```
 
-## Quick Start
+## Usage
+
+### Python API
 
 ```python
 import torch
 import timm
 from rajni import RAJNIViTWrapper
 
-# Create base ViT model
-base = timm.create_model(
-    "vit_base_patch16_224",
-    pretrained=True,
-)
+base = timm.create_model("vit_base_patch16_224", pretrained=True)
 
-# Define pruning schedule
 schedule = {
     3: {"keep_ratio": 0.88, "update": True},
     4: {"keep_ratio": 0.88, "update": True},
-    7: {"keep_ratio": 0.8, "update": True},
+    7: {"keep_ratio": 0.80, "update": True},
     8: {"keep_ratio": 0.72, "update": True},
 }
 
-# Wrap with RAJNI
 model = RAJNIViTWrapper(base, schedule)
 model.cuda().eval()
 
-# Test inference
 x = torch.randn(1, 3, 224, 224, device="cuda")
 with torch.no_grad():
-    y = model(x)
+    out = model(x)
 
-print(y.shape)
-print(model.get_last_stats())
+print(out.shape)              # classification logits
+print(model.get_last_stats()) # per-layer token counts
 ```
 
-## Evaluation
+### CLI Evaluation
 
-### Using run.py
+Evaluate on an ImageNet-style validation set:
 
 ```bash
 python -m rajni.run \
-  --data_path ../../Downloads/val \  #Path to dataset
-  --model vit_base_patch16_224 \     
-  --batch_size 256 \                 
-  --schedule schedule.json \    #json file location with schedule
-  --compare_base \           #Use if want a comparison with base model
-  --max_batches 100 \
+  --data_path /path/to/val \
+  --schedule schedule.json \
+  --model vit_base_patch16_224 \
+  --batch_size 256 \
+  --device cuda \
   --warmup 5 \
-  --device cuda
+  --max_batches 100 \
+  --compare_base
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--data_path` | Path to the dataset root (required) |
+| `--schedule` | Path to a JSON pruning schedule file (required) |
+| `--model` | Any timm ViT model name (default: `vit_base_patch16_224`) |
+| `--batch_size` | Evaluation batch size (default: `256`) |
+| `--device` | `cuda` or `cpu` (default: `cuda`) |
+| `--warmup` | Warmup batches before timing (default: `5`) |
+| `--max_batches` | Limit the number of batches evaluated |
+| `--compare_base` | Also benchmark the unpruned base model |
 
 ### Programmatic Evaluation
 
 ```python
 from rajni import evaluate_model
-# Evaluate on validation set
-acc, throughput = evaluate_model(
+
+accuracy, throughput = evaluate_model(
     model=model,
     dataloader=val_loader,
     device="cuda",
-    max_batches=None,  # Use None for full dataset
-    warmup=50
+    max_batches=None,
+    warmup=5,
 )
 ```
 
-## Pruning Schedule
+## Pruning Schedule Format
 
-The pruning schedule is a dictionary where:
-- **Key**: Transformer block index
-- **Value**: Configuration dict with:
-  - `keep_ratio`: Fraction of tokens to keep (e.g., 0.88 = keep 88%)
-  - `update`: Whether to update importance scores dynamically
+The schedule maps transformer block indices to pruning configurations:
+
+```json
+{
+  "3": { "keep_ratio": 0.95, "update": false },
+  "5": { "keep_ratio": 0.85, "update": true }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `keep_ratio` | Fraction of tokens retained at this block (e.g., `0.85` keeps 85%) |
+| `update` | Recompute importance scores at this block (`true`/`false`) |
