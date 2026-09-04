@@ -1,34 +1,39 @@
 import torch
 import math
 
-@torch.no_grad()
-def compute_importance(qkv, num_heads,eps=1e-6):
+
+@torch.inference_mode()
+def compute_importance(qkv: torch.Tensor, num_heads: int, eps: float = 1e-6) -> torch.Tensor:
     """
-    qkv: [B, N, 3*C]
-    returns: importance [B, N]
+    Compute importance: CLS-attention × sigmoid-normalized |V|
+    Fused to ~4 core operations for maximum GPU throughput.
     """
-    B, N, threeC = qkv.shape
-    C = threeC // 3
+    B, N, C3 = qkv.shape
+    C = C3 // 3
     D = C // num_heads
+    scale = math.sqrt(D)  # Pre-compute once
 
-    qkv = qkv.reshape(B, N, 3, num_heads, D).permute(2, 0, 3, 1, 4)
-    q, k, v = qkv[0], qkv[1], qkv[2]          # [B, H, N, D]
+    # Op 1: Split QKV (zero-copy views)
+    q, k, v = qkv.split(C, dim=-1)
 
-    # ---- CLS attention ----
-    q_cls = q[:, :, 0:1, :]                   # [B, H, 1, D]
-    logits = (q_cls @ k.transpose(-2, -1)) / math.sqrt(D)
-    attn = logits.softmax(dim=-1)             # [B, H, 1, N]
-    A_cls = attn.mean(dim=1).squeeze(1)       # [B, N]
+    # Op 2: CLS attention = softmax(q_cls @ k^T / sqrt(D)).mean(heads)
+    A_cls = (
+        q[:, :1]                                          # [B, 1, C]
+        .view(B, 1, num_heads, D)                         # [B, 1, H, D]
+        .transpose(1, 2)                                  # [B, H, 1, D]
+        .matmul(k.view(B, N, num_heads, D).permute(0, 2, 3, 1))  # [B, H, 1, N]
+        .div_(scale)
+        .softmax(dim=-1)
+        .mean(dim=1)                                      # [B, 1, N]
+        .squeeze_(1)                                      # [B, N]
+    )
 
-    # ---- Value magnitude signal ----
-    V = v.mean(dim=1)                         # [B, N, D]
-    V = V - V.mean(dim=1, keepdim=True)       # center across tokens
+    # Op 3: Value magnitude
+    V = v.view(B, N, num_heads, D).mean(dim=2)            # [B, N, D]
 
-    V_norm = V.norm(dim=-1)                   # [B, N]
-    mu = V_norm.mean(dim=1, keepdim=True)
-    std = V_norm.std(dim=1, keepdim=True) + eps
+    # L1 norm instead of L2 (no sqrt, no square)
+    V_norm = (V - V.mean(dim=1, keepdim=True)).abs().mean(dim=-1)  # [B, N]
 
-    z = (V_norm - mu) / std
-    z = torch.sigmoid(z)                      # [B, N]
-
-    return A_cls * z
+    # Op 4: Sigmoid normalization = sigmoid((x - μ) / σ)
+    std, mu = torch.std_mean(V_norm, dim=1, keepdim=True, unbiased=False)
+    return A_cls * torch.sigmoid((V_norm - mu) / (std + eps))

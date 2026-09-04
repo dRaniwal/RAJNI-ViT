@@ -1,23 +1,27 @@
 import torch
 import torch.nn as nn
-import math
+import torch.nn.functional as F
+from typing import Tuple
 from .importance import compute_importance
 
 
 class RAJNIAttention(nn.Module):
     """
-    RAJNI Attention with dynamic q-norm exponential scheduling.
-    No fixed keep_ratio — computed per-batch based on layer difficulty.
+    RAJNI Attention with dynamic D_l threshold gating.
+    Optimized for A100 / modern GPUs.
     """
+    __constants__ = ['num_heads', 'scale', 'head_dim', 'embed_dim',
+                     'layer_idx', 'percentile', 'kr_min', 'gamma', 'tau_warmup']
+
     def __init__(
         self,
         attn: nn.Module,
         layer_idx: int,
         *,
-        percentile=0.75,
-        kr_min=0.60,
-        gamma=2.5,
-        skip_layers=(10, 11),
+        percentile: float = 0.75,
+        kr_min: float = 0.60,
+        gamma: float = 2.5,
+        tau_warmup: float = 0.10,  # Dynamic threshold for Phase 1 vs Phase 2
     ):
         super().__init__()
         self.num_heads = attn.num_heads
@@ -26,81 +30,97 @@ class RAJNIAttention(nn.Module):
         self.proj = attn.proj
         self.proj_drop = attn.proj_drop
 
+        # Pre-computed constants
+        self.head_dim = attn.qkv.out_features // (3 * self.num_heads)
+        self.embed_dim = attn.qkv.out_features // 3
+
         self.layer_idx = layer_idx
         self.percentile = percentile
         self.kr_min = kr_min
         self.gamma = gamma
-        self.skip_layers = skip_layers
+        self.tau_warmup = tau_warmup
 
-    def forward(self, x):
-        """
-        x: [B, N, C]
-        Returns: (out, keep_idx)
-        """
+        # Register buffer for CLS index
+        self.register_buffer('_cls_zero', torch.tensor(0, dtype=torch.long), persistent=False)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
-
-        # ==================================================
-        # 🔒 Skip layers → full attention (no pruning)
-        # ==================================================
-        if self.layer_idx in self.skip_layers:
-            qkv = self.qkv(x)
-            qkv = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads)
-            qkv = qkv.permute(2, 0, 3, 1, 4)
-            q, k, v = qkv[0], qkv[1], qkv[2]
-
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = attn.softmax(dim=-1)
-
-            out = (attn @ v).transpose(1, 2).reshape(B, N, C)
-            out = self.proj(out)
-            out = self.proj_drop(out)
-
-            # Return all indices (no pruning)
-            keep_idx = torch.arange(N, device=x.device).unsqueeze(0).repeat(B, 1)
-            return out, keep_idx
-
-        # ==================================================
-        # 🧠 Dynamic scheduling: importance → q-norm → prune
-        # ==================================================
         qkv = self.qkv(x)
-        scores = compute_importance(qkv, self.num_heads)
 
-        # ---- Compute q-norm layer difficulty ----
-        patch_scores = scores[:, 1:] + 1e-12
-        log_scores = patch_scores.log()
-
-        q = torch.quantile(log_scores, self.percentile, dim=1, keepdim=True)
-        diff = torch.clamp(q - log_scores, min=0.0)
-
-        D_l = (diff.mean(dim=1) / q.abs().squeeze(1)).mean().item()
-
-        # ---- Exponential keep ratio (dynamic) ----
-        keep_ratio = max(self.kr_min, math.exp(-self.gamma * D_l))
+        # EDGE CASE: only CLS token or no patches remain
+        if N <= 2:
+            return self._full_attn_from_qkv(qkv, B, N, C)
 
         num_patches = N - 1
-        keep = max(1, int(keep_ratio * num_patches))
 
-        # ---- Token selection ----
-        _, idx = torch.topk(patch_scores, keep, dim=1)
-        idx = idx.sort(dim=1).values
+        # ---- Importance Calculation ----
+        scores = compute_importance(qkv, self.num_heads)
+        patch_scores = scores[:, 1:].add(1e-12)   # [B, num_patches]
+        log_scores = patch_scores.log()
 
-        cls_idx = torch.zeros((B, 1), device=x.device, dtype=torch.long)
-        keep_idx = torch.cat([cls_idx, idx + 1], dim=1)
+        # Mean + std deviation estimation (approx 75th percentile)
+        mu = log_scores.mean(dim=1, keepdim=True)
+        sigma = log_scores.std(dim=1, keepdim=True)
+        q_val = mu + (sigma * 0.675)
 
-        # ---- Prune QKV ----
-        gather = keep_idx.unsqueeze(-1).expand(-1, -1, qkv.shape[-1])
-        qkv = torch.gather(qkv, 1, gather)
+        diff = (q_val - log_scores).clamp_(min=0.0)
 
-        Np = qkv.shape[1]
-        qkv = qkv.reshape(B, Np, 3, self.num_heads, C // self.num_heads)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        # ---- Global Dispersion (D_l) ----
+        D_l = (diff.mean(dim=1) / q_val.abs().squeeze(1)).mean().item()
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        # ==================================================
+        # DYNAMIC SKIP LAYER GATING
+        # ==================================================
+        if D_l < self.tau_warmup:
+            # Phase 1: Network is gathering diffuse features. Skip pruning!
+            return self._full_attn_from_qkv(qkv, B, N, C)
 
-        out = (attn @ v).transpose(1, 2).reshape(B, Np, C)
-        out = self.proj(out)
-        out = self.proj_drop(out)
+        # Phase 2: Semantic saturation achieved. Prune aggressively.
+        keep_ratio = torch.exp(torch.tensor(-self.gamma * D_l)).clamp(min=self.kr_min)
+        keep = int(round(keep_ratio.item() * num_patches))
+
+        # Safety clamp
+        keep = max(1, min(keep, num_patches))
+
+        # If math says keep everything, bypass gather ops
+        if keep == num_patches:
+            return self._full_attn_from_qkv(qkv, B, N, C)
+
+        # ---- Top-k (true pruning, no mask tricks) ----
+        _, idx = torch.topk(patch_scores, keep, dim=1, sorted=False)
+
+        # ---- Build keep_idx (CLS + patches) ----
+        keep_idx = torch.empty(B, keep + 1, device=qkv.device, dtype=torch.long)
+        keep_idx[:, 0] = 0
+        keep_idx[:, 1:] = idx + 1
+
+        # ---- Gather (actual FLOP reduction) ----
+        qkv = qkv.gather(1, keep_idx.unsqueeze(-1).expand(-1, -1, qkv.size(-1)))
+
+        Np = keep + 1
+        q, k, v = self._split_qkv(qkv, B, Np)
+
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        out = out.transpose(1, 2).reshape(B, Np, C)
+        out = self.proj_drop(self.proj(out))
 
         return out, keep_idx
+
+    def _full_attn_from_qkv(self, qkv: torch.Tensor, B: int, N: int, C: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Bypass pruning and process the full sequence through SDPA."""
+        q, k, v = self._split_qkv(qkv, B, N)
+
+        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj_drop(self.proj(out))
+
+        keep_idx = torch.arange(N, device=qkv.device, dtype=torch.long).expand(B, -1)
+        return out, keep_idx
+
+    def _split_qkv(self, qkv: torch.Tensor, B: int, N: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Efficient QKV split and reshape."""
+        q, k, v = qkv.split(self.embed_dim, dim=-1)
+        q = q.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        return q, k, v

@@ -38,8 +38,10 @@ def get_args():
                         help="Minimum keep ratio")
     parser.add_argument("--gamma", type=float, default=2.5,
                         help="Exponential decay rate for keep ratio")
-    parser.add_argument("--skip_layers", type=int, nargs="+", default=[10, 11],
-                        help="Layer indices to skip pruning (full attention)")
+    parser.add_argument("--tau_warmup", type=float, default=0.10,
+                        help="Dispersion threshold below which a layer skips pruning (Phase 1 warmup)")
+    parser.add_argument("--compile_blocks", action="store_true", default=False,
+                        help="torch.compile each block's MLP for extra throughput")
 
     # Eval
     parser.add_argument("--warmup", type=int, default=5)
@@ -124,28 +126,28 @@ def main():
     if args.schedule is not None:
         with open(args.schedule, "r") as f:
             dynamic_params = json.load(f)
-        
+
         percentile = dynamic_params.get("percentile", args.percentile)
         kr_min = dynamic_params.get("kr_min", args.kr_min)
         gamma = dynamic_params.get("gamma", args.gamma)
-        skip_layers = tuple(dynamic_params.get("skip_layers", args.skip_layers))
-        
+        tau_warmup = dynamic_params.get("tau_warmup", args.tau_warmup)
+
         print("\nLoaded RAJNI dynamic parameters:")
         print(f"  percentile: {percentile}")
         print(f"  kr_min: {kr_min}")
         print(f"  gamma: {gamma}")
-        print(f"  skip_layers: {skip_layers}")
+        print(f"  tau_warmup: {tau_warmup}")
     else:
         percentile = args.percentile
         kr_min = args.kr_min
         gamma = args.gamma
-        skip_layers = tuple(args.skip_layers)
-        
+        tau_warmup = args.tau_warmup
+
         print("\nUsing default RAJNI dynamic parameters:")
         print(f"  percentile: {percentile}")
         print(f"  kr_min: {kr_min}")
         print(f"  gamma: {gamma}")
-        print(f"  skip_layers: {skip_layers}")
+        print(f"  tau_warmup: {tau_warmup}")
 
     rajni_model = RAJNIViTWrapper(
         base_model=timm.create_model(
@@ -155,7 +157,8 @@ def main():
         percentile=percentile,
         kr_min=kr_min,
         gamma=gamma,
-        skip_layers=skip_layers,
+        tau_warmup=tau_warmup,
+        compile_blocks=args.compile_blocks,
     ).to(device).eval()
 
     print("\n🔹 Evaluating RAJNI model")
